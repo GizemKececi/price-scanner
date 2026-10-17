@@ -1,4 +1,4 @@
-"""Price Scanner — kompakt mobil kamera, doğrulamalı OCR ve tam gösterilen online kur."""
+"""Price Scanner — WebRTC gerektirmeyen akıcı kamera, doğrulamalı OCR, tam online kur."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import truststore
 truststore.inject_into_ssl()
 
 import html
+import base64
 import re
 import threading
 import time
@@ -14,14 +15,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from queue import Empty, Full, Queue
 
-import av
 import cv2
 import easyocr
 import numpy as np
 import requests
 import streamlit as st
 from PIL import Image
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 from tax_rules import COUNTRIES, RULES_REVIEWED, estimate_refund
 
@@ -31,7 +30,7 @@ st.set_page_config(page_title="Price Scanner", page_icon="🔎", layout="centere
 # iPhone'un dikey kamera görüntüsü önizlemede object-fit: cover ile ortadan kırpılır.
 OCR_X_MIN, OCR_X_MAX = 0.08, 0.92
 OCR_Y_MIN, OCR_Y_MAX = 0.31, 0.69
-OCR_INTERVAL_SECONDS = 0.95
+OCR_INTERVAL_SECONDS = 1.8
 ZERO_DECIMAL = {"KRW", "JPY"}
 NUMBERS = re.compile(r"(?<!\d)\d[\d.,\s]*\d|(?<!\d)\d(?!\d)")
 
@@ -161,14 +160,13 @@ class ScanState:
         self.queue: Queue = Queue(maxsize=1)
         self.price: Decimal | None = None
         self.raw = ""
-        self.last_frame = 0.0
         self.worker_started = False
         self.currency = "KRW"
         self.country = "Güney Kore"
         self.proposed: Decimal | None = None
         self.proposed_hits = 0
         self.proposed_at = 0.0
-        self.status = "START'e bas ve fiyatı yeşil alanın ortasına getir."
+        self.status = "Kamerayı başlatıp fiyatı yeşil çerçevenin içine getir."
 
 
 def enqueue_fresh(state: ScanState, item):
@@ -207,14 +205,14 @@ def start_worker(state: ScanState, reader):
                     if selected_currency != state.currency:
                         continue
                     if number is None:
-                        if now - state.proposed_at > 5:
+                        if now - state.proposed_at > 8:
                             state.proposed = None
                             state.proposed_hits = 0
                         if state.price is None:
                             state.status = "Henüz net fiyat yok. Biraz yaklaştırıp sabit tut."
                         continue
 
-                    if number != state.proposed or (now - state.proposed_at > 5):
+                    if number != state.proposed or (now - state.proposed_at > 8):
                         state.proposed = number
                         state.proposed_hits = 1
                     else:
@@ -269,9 +267,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "scanner_state_v3" not in st.session_state:
-    st.session_state.scanner_state_v3 = ScanState()
-state: ScanState = st.session_state.scanner_state_v3
+if "scanner_state_v4" not in st.session_state:
+    st.session_state.scanner_state_v4 = ScanState()
+state: ScanState = st.session_state.scanner_state_v4
 
 with state.lock:
     if state.country != country or state.currency != currency:
@@ -290,55 +288,162 @@ with state.lock:
 
 mode = st.radio("Tarama şekli", ["Canlı kamera", "Fotoğraf çek"], horizontal=True, label_visibility="collapsed")
 
+# Kamerayı WebRTC ile sunucuya bağlamak yerine tarayıcının getUserMedia
+# API'siyle DOĞRUDAN telefonda açıyoruz. CANLI ÖNİZLEME ağ gecikmesinden etkilenmez.
+# Sunucuya sadece yeşil çerçevenin içindeki JPEG kareler gider.
+CAMERA_HTML = """
+<div class="ps-camera-wrap">
+  <video id="ps-local-video" muted autoplay playsinline webkit-playsinline></video>
+  <div id="ps-guide"><span>FİYATI BURAYA GETİR</span></div>
+  <div id="ps-camera-message">Kamerayı başlatmak için düğmeye dokun.</div>
+</div>
+<div class="ps-controls">
+  <button type="button" id="ps-start">📷 Kamerayı aç</button>
+  <button type="button" id="ps-stop" hidden>■ Durdur</button>
+  <span id="ps-camera-status" role="status" aria-live="polite">Hazır</span>
+</div>
+"""
+
+CAMERA_CSS = """
+.ps-camera-wrap {width:100%;height:225px;position:relative;overflow:hidden;
+  background:#111;border-radius:10px;border:1px solid #444;}
+#ps-local-video {width:100%;height:100%;object-fit:cover;display:block;}
+#ps-guide {pointer-events:none;position:absolute;left:7%;right:7%;top:17%;bottom:17%;
+  border:2px solid #4be49a;border-radius:8px;box-shadow:0 0 0 800px rgba(0,0,0,.26);}
+#ps-guide span {position:absolute;top:-1.35em;left:0;color:#5bf9ac;font-size:11px;
+  font-weight:700;letter-spacing:.06em;text-shadow:0 1px 2px #000;}
+#ps-camera-message {position:absolute;left:10%;right:10%;top:40%;
+  text-align:center;color:#ddd;font-size:13px;}
+.ps-controls {display:flex;align-items:center;gap:10px;padding-top:7px;}
+.ps-controls button {border:0;border-radius:7px;background:#ee5959;color:white;
+  padding:7px 13px;font-size:13px;font-weight:600;min-height:35px;cursor:pointer;}
+.ps-controls button[hidden] {display:none;}
+#ps-camera-status {font-size:12px;color:#999;}
+"""
+
+CAMERA_JS = r"""
+export default function (component) {
+  const root = component.parentElement;
+  const video = root.querySelector('#ps-local-video');
+  const msg = root.querySelector('#ps-camera-message');
+  const startBtn = root.querySelector('#ps-start');
+  const stopBtn = root.querySelector('#ps-stop');
+  const status = root.querySelector('#ps-camera-status');
+  const guide = root.querySelector('#ps-guide');
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', {willReadFrequently:false});
+  let stream = null;
+  let timer = null;
+  let disposed = false;
+
+  function stopCamera() {
+    if (timer !== null) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
+    video.srcObject = null;
+    startBtn.hidden = false;
+    stopBtn.hidden = true;
+    msg.style.display = 'block';
+    status.textContent = 'Durduruldu';
+  }
+
+  // Görüntüdeki yeşil alanı birebir al: object-fit:cover kırpmasını hesaba kat.
+  function capture() {
+    if (!stream || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const cw = video.clientWidth;
+    const ch = video.clientHeight;
+    if (!cw || !ch) return;
+    const scale = Math.max(cw / vw, ch / vh);
+    const visibleW = cw / scale;
+    const visibleH = ch / scale;
+    const offX = (vw - visibleW) / 2;
+    const offY = (vh - visibleH) / 2;
+    const gx = guide.offsetLeft / scale;
+    const gy = guide.offsetTop / scale;
+    const gw = guide.clientWidth / scale;
+    const gh = guide.clientHeight / scale;
+    const sx = Math.max(0, offX + gx);
+    const sy = Math.max(0, offY + gy);
+    const sw = Math.max(1, Math.min(vw - sx, gw));
+    const sh = Math.max(1, Math.min(vh - sy, gh));
+    // 1200 px'e kadar OCR için yeterli çözünürlük; gereksiz veri gönderme.
+    const factor = Math.min(1, 1200 / sw);
+    canvas.width = Math.max(1, Math.floor(sw * factor));
+    canvas.height = Math.max(1, Math.floor(sh * factor));
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    const jpeg = canvas.toDataURL('image/jpeg', 0.78);
+    component.setTriggerValue('frame', jpeg.split(',')[1]);
+    status.textContent = 'Fiyat kontrol ediliyor…';
+  }
+
+  async function startCamera() {
+    if (stream) return;
+    startBtn.disabled = true;
+    status.textContent = 'Kamera açılıyor…';
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}},
+        audio: false
+      });
+      if (disposed) {s.getTracks().forEach(track=>track.stop());return;}
+      stream = s;
+      video.srcObject = s;
+      await video.play();
+      msg.style.display = 'none';
+      startBtn.hidden = true;
+      stopBtn.hidden = false;
+      status.textContent = 'Canlı kamera açık';
+      timer = setInterval(capture, 1800);
+      setTimeout(capture, 750);
+    } catch(err) {
+      status.textContent = 'Kamera açılamadı: ' + (err?.name || 'izin veya tarayıcı');
+      msg.textContent = 'Safari kamera iznini kontrol et. Gerekirse Fotoğraf çek modunu kullan.';
+    } finally { startBtn.disabled = false; }
+  }
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  return () => {disposed = true;stopCamera();};
+}
+"""
+
 if mode == "Canlı kamera":
+    # Tamamen tarayıcı tabanlı önizleme: WebRTC, STUN veya TURN gerektirmez.
     reader = load_reader()
     start_worker(state, reader)
 
-    def video_callback(frame: av.VideoFrame) -> av.VideoFrame:
-        # SENDONLY: Tarayıcı gerçek kamera önizlemesini kendi çizer, sunucu dönüşünü beklemez.
-        now = time.monotonic()
-        with state.lock:
-            if now - state.last_frame < OCR_INTERVAL_SECONDS:
-                return frame
-            state.last_frame = now
-            current_currency = state.currency
-        img = frame.to_ndarray(format="bgr24")
-        x1, y1, x2, y2 = center_region(img)
-        enqueue_fresh(state, (img[y1:y2, x1:x2].copy(), current_currency))
-        return frame
+    def on_browser_frame():
+        payload = st.session_state.get("ps_browser_cam_v4")
+        # Components v2 değerleri Streamlit sürümüne göre dict veya
+        # attribute erişimli sonuç nesnesi olabiliyor.
+        if isinstance(payload, dict):
+            raw_b64 = payload.get("frame")
+        else:
+            raw_b64 = getattr(payload, "frame", None) if payload is not None else None
+        if not isinstance(raw_b64, str) or len(raw_b64) > 3_000_000:
+            return
+        try:
+            decoded = base64.b64decode(raw_b64, validate=True)
+            arr = cv2.imdecode(np.frombuffer(decoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if arr is not None:
+                with state.lock:
+                    selected_currency = state.currency
+                enqueue_fresh(state, (arr, selected_currency))
+        except (ValueError, TypeError):
+            pass
 
-    webrtc_streamer(
-        key="price-scanner-local-compact-v3",
-        mode=WebRtcMode.SENDONLY,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        media_stream_constraints={
-            "video": {
-                "facingMode": {"ideal": "environment"},
-                "width": {"ideal": 960},
-                "height": {"ideal": 720},
-                "frameRate": {"ideal": 24, "max": 30},
-            },
-            "audio": False,
-        },
-        video_html_attrs={
-            "autoPlay": True,
-            "controls": False,
-            "muted": True,
-            "style": {
-                "width": "100%",
-                "height": "225px",
-                "objectFit": "cover",
-                "border": "2px solid #43d790",
-                "borderRadius": "10px",
-                "background": "#121212",
-            },
-        },
-        video_frame_callback=video_callback,
-        async_processing=True,
+    local_camera = st.components.v2.component(
+        "price_scanner_browser_camera_v4",
+        html=CAMERA_HTML, css=CAMERA_CSS, js=CAMERA_JS,
+    )
+    local_camera(
+        key="ps_browser_cam_v4",
+        on_frame_change=on_browser_frame,
+        height=282,
     )
     st.markdown(
-        '<div class="ps-tip">Yeşil çerçevenin ortasındaki fiyatı 2–3 saniye sabit tut · '
-        'OCR iki okumayla doğrular, fiyat değişimini üç okumayla doğrular.</div>',
+        '<div class="ps-tip">Telefon ekranında canlı önizleme · fiyatı yeşil çerçeveye getir. '
+        'OCR ilk fiyatı 2, yeni fiyatı 3 tutarlı okumayla doğrular.</div>',
         unsafe_allow_html=True,
     )
 else:
@@ -359,6 +464,13 @@ else:
                 state.status = "✅ Fotoğraftan fiyat okundu"
         else:
             st.warning("Fiyat bulunamadı; daha yakından, aydınlıkta tekrar çek.")
+
+
+def override_pct_value() -> Decimal | None:
+    enabled = st.session_state.get(f"ps_custom_enabled_{country}", False)
+    if not enabled:
+        return None
+    return Decimal(str(st.session_state.get(f"ps_custom_pct_{country}", 0.0)))
 
 
 @st.fragment(run_every="1s")
@@ -415,15 +527,6 @@ def show_results():
         st.caption("Tek ürün tutarı iade alt sınırında değil; fiş toplamı farklı olabilir.")
     elif calc.status == "estimated":
         st.caption("Vergi iadesi tahminidir; mağaza ve iade operatörüne göre değişebilir.")
-
-
-# İade oranı opsiyonel gelişmiş ayar. Widget değeri fragment'ten okunabilsin diye
-# varsayılanı Session State'te tutuyoruz; uygulama ilk kez çalışırken de hazır.
-def override_pct_value() -> Decimal | None:
-    enabled = st.session_state.get(f"ps_custom_enabled_{country}", False)
-    if not enabled:
-        return None
-    return Decimal(str(st.session_state.get(f"ps_custom_pct_{country}", 0.0)))
 
 
 show_results()
