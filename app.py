@@ -1,11 +1,12 @@
-"""Telefon kamerasıyla fiyat tarayan, TL ve tahmini tax-free tutarı hesaplayan Streamlit MVP."""
+"""Price Scanner — kompakt mobil kamera, doğrulamalı OCR ve tam gösterilen online kur."""
 
 from __future__ import annotations
 
-# Mac ve Linux sistem sertifikalarını kullanarak SSL doğrulamasını koru.
+# macOS'taki yerel SSL sorunlarında sistem sertifikalarından yararlan.
 import truststore
 truststore.inject_into_ssl()
 
+import html
 import re
 import threading
 import time
@@ -26,13 +27,59 @@ from tax_rules import COUNTRIES, RULES_REVIEWED, estimate_refund
 
 st.set_page_config(page_title="Price Scanner", page_icon="🔎", layout="centered")
 
+# Görünür kamera alanı kısa ve yataydır; burası OCR'de kullanılan merkez bant.
+# iPhone'un dikey kamera görüntüsü önizlemede object-fit: cover ile ortadan kırpılır.
+OCR_X_MIN, OCR_X_MAX = 0.08, 0.92
+OCR_Y_MIN, OCR_Y_MAX = 0.31, 0.69
+OCR_INTERVAL_SECONDS = 0.95
 ZERO_DECIMAL = {"KRW", "JPY"}
 NUMBERS = re.compile(r"(?<!\d)\d[\d.,\s]*\d|(?<!\d)\d(?!\d)")
+
+st.markdown(
+    """
+    <style>
+      header[data-testid="stHeader"] { height: 0; min-height: 0; display: none; }
+      [data-testid="stToolbar"] { display: none; }
+      #MainMenu { visibility: hidden; }
+      .block-container { padding-top: .7rem; padding-bottom: 1.5rem; max-width: 610px; }
+      [data-testid="stVerticalBlock"] { gap: .42rem; }
+      div[data-testid="stMetric"] { padding: 0; }
+      .ps-topline {font-weight: 700; font-size: 1.17rem; line-height: 1.3; margin: .1rem 0 .2rem; }
+      .ps-rate {font-size: .92rem; padding: .34rem .56rem; border: 1px solid rgba(128,128,128,.25); border-radius: 9px; line-height: 1.5; }
+      .ps-meta {color: #888; font-size: .74rem; margin-top: .1rem;}
+      .ps-tip {font-size: .76rem; color: #888; margin-bottom: .1rem;}
+      .ps-detected {font-size: .94rem; font-weight: 600; margin: .15rem 0 .36rem;}
+      .ps-status {font-size: .82rem; color: #777; padding: .35rem .1rem;}
+      .ps-values {display:grid; grid-template-columns:1fr 1fr; gap: .55rem; }
+      .ps-value {border: 1px solid rgba(128,128,128,.22); border-radius: 10px; padding: .68rem .53rem; min-width:0;}
+      .ps-value-label {font-size:.76rem; line-height:1.3; color:#888; min-height: 2.0em;}
+      .ps-value-number {font-size: clamp(1.22rem, 5.3vw, 1.82rem); font-weight:750; line-height:1.35; white-space:nowrap; letter-spacing:-.035em;}
+      .ps-saving {font-size:.79rem; color:#888; padding: .25rem 0 0;}
+      @media (max-width: 640px) {
+        .block-container {padding-top: .35rem; padding-left: .85rem; padding-right: .85rem;}
+        .ps-value {padding: .54rem .48rem;}
+        .ps-value-label {font-size:.72rem;}
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def format_tr(value: Decimal, places: int = 2) -> str:
+    quantizer = Decimal("1") if places == 0 else Decimal("0.01")
+    s = f"{value.quantize(quantizer, rounding=ROUND_HALF_UP):,.{places}f}"
+    return s.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def format_fx_exact(value: Decimal) -> str:
+    """Asla yuvarlama: API'den gelip matematikte kullanılan Decimal'ın tüm basamakları."""
+    return format(value, "f").replace(".", ",")
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_fx(currency: str) -> tuple[Decimal, str]:
-    """Frankfurter günlük referans kuru: 1 birim kaynak para kaç TRY."""
+    """Frankfurter'ın son yayımladığı günlük referans kuru, 1 birim = kaç TRY."""
     response = requests.get(
         f"https://api.frankfurter.dev/v2/rate/{currency}/TRY",
         timeout=12,
@@ -42,79 +89,70 @@ def fetch_fx(currency: str) -> tuple[Decimal, str]:
     return Decimal(str(data["rate"])), data["date"]
 
 
-@st.cache_resource(show_spinner="OCR modeli hazırlanıyor (ilk seferde indirilebilir)…")
+@st.cache_resource(show_spinner="OCR modeli hazırlanıyor…")
 def load_reader():
-    # İlk çalıştırmada EasyOCR model dosyalarını indirir.
     return easyocr.Reader(["en"], gpu=False)
 
 
 def parse_amount(raw: str, currency: str) -> Decimal | None:
-    """OCR metnini binlik ve ondalık ayraçlarını hesaba katarak sayıya çevir."""
     digits = re.sub(r"[^0-9]", "", raw)
     if not digits:
         return None
     raw = raw.strip().replace(" ", "")
     if currency in ZERO_DECIMAL:
-        # Won ve yen etikette genellikle tam sayı olarak yazılır.
         return Decimal(digits)
-
-    # Ondalık ayraç, varsa en sağdaki virgül/noktadır; sonundaki
-    # 1-2 hane kuruş/cent olarak kabul edilir.
-    last_comma, last_dot = raw.rfind(","), raw.rfind(".")
-    sep_idx = max(last_comma, last_dot)
-    if sep_idx >= 0 and len(raw) - sep_idx - 1 in (1, 2):
-        decimals = len(raw) - sep_idx - 1
+    separator = max(raw.rfind(","), raw.rfind("."))
+    if separator >= 0 and len(raw) - separator - 1 in (1, 2):
+        decimals = len(raw) - separator - 1
         return Decimal(digits[:-decimals] + "." + digits[-decimals:])
     return Decimal(digits)
 
 
+def center_region(img: np.ndarray) -> tuple[int, int, int, int]:
+    height, width = img.shape[:2]
+    return (
+        int(width * OCR_X_MIN), int(height * OCR_Y_MIN),
+        int(width * OCR_X_MAX), int(height * OCR_Y_MAX),
+    )
+
+
 def scan_crop(bgr: np.ndarray, currency: str, reader) -> tuple[Decimal | None, str]:
-    """En uzun rakam dizisi; eşitlikte daha büyük görünür alan."""
+    """Güvenilir ve uzun rakam dizisini seç. OCR doğrulamasını asla atlama."""
+    if bgr.size == 0:
+        return None, ""
     h, w = bgr.shape[:2]
-    # Küçük baskıların okunmasını kolaylaştırmak için büyüt.
     if w < 1100:
-        factor = min(2.0, 1100 / max(w, 1))
-        bgr = cv2.resize(bgr, None, fx=factor, fy=factor)
+        scale = min(2.0, 1100 / max(w, 1))
+        bgr = cv2.resize(bgr, None, fx=scale, fy=scale)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     results = reader.readtext(
-        rgb, detail=1, paragraph=False,
+        rgb,
+        detail=1,
+        paragraph=False,
         allowlist="0123456789., ",
     )
 
     candidates = []
     for box, text, confidence in results:
-        if confidence < 0.25:
+        if confidence < 0.30:
             continue
         for match in NUMBERS.finditer(text):
             raw = match.group().strip()
-            value = parse_amount(raw, currency)
-            if value is None or value <= 0:
+            digit_count = sum(c.isdigit() for c in raw)
+            # Won/Yen etiketinde tek hane / 46 gibi parçalı OCR okumaları fiyat sayma.
+            min_digits = 3 if currency in ZERO_DECIMAL else 2
+            if digit_count < min_digits:
                 continue
-            digit_length = sum(ch.isdigit() for ch in raw)
-            if digit_length < 2:  # Tarih, yüzde işareti, tek karakter vb. azalt.
+            amount = parse_amount(raw, currency)
+            if amount is None or amount <= 0:
                 continue
-            pts = np.array(box, dtype=np.float32)
-            bounding = cv2.boundingRect(pts)
-            area = bounding[2] * bounding[3]
-            candidates.append((digit_length, area, confidence, value, raw))
+            _x, _y, area_w, area_h = cv2.boundingRect(np.asarray(box, dtype=np.float32))
+            candidates.append((digit_count, area_w * area_h, confidence, amount, raw))
 
     if not candidates:
         return None, ""
-    _digits, _area, _confidence, amount, raw = max(candidates, key=lambda x: x[:3])
-    return amount, raw
-
-
-def center_region(img: np.ndarray):
-    h, w = img.shape[:2]
-    x1, x2 = int(w * 0.09), int(w * 0.91)
-    y1, y2 = int(h * 0.32), int(h * 0.65)
-    return x1, y1, x2, y2
-
-
-def format_tr(value: Decimal, places: int = 2) -> str:
-    q = Decimal("1") if places == 0 else Decimal("0.01")
-    s = f"{value.quantize(q, rounding=ROUND_HALF_UP):,.{places}f}"
-    return s.replace(",", "_").replace(".", ",").replace("_", ".")
+    *_, value, raw = max(candidates, key=lambda x: x[:3])
+    return value, raw
 
 
 class ScanState:
@@ -127,17 +165,36 @@ class ScanState:
         self.worker_started = False
         self.currency = "KRW"
         self.country = "Güney Kore"
-        self.status = "Kamerayı başlatıp fiyatı yeşil kutuya hizalayın."
+        self.proposed: Decimal | None = None
+        self.proposed_hits = 0
+        self.proposed_at = 0.0
+        self.status = "START'e bas ve fiyatı yeşil alanın ortasına getir."
+
+
+def enqueue_fresh(state: ScanState, item):
+    """OCR yoğunken sırada bayat kare biriktirme, en son kadrajı işle."""
+    try:
+        state.queue.put_nowait(item)
+        return
+    except Full:
+        pass
+    try:
+        state.queue.get_nowait()
+    except Empty:
+        pass
+    try:
+        state.queue.put_nowait(item)
+    except Full:
+        pass
 
 
 def start_worker(state: ScanState, reader):
-    if state.worker_started:
-        return
-    state.worker_started = True
+    with state.lock:
+        if state.worker_started:
+            return
+        state.worker_started = True
 
     def run():
-        previous = None
-        repetitions = 0
         while True:
             try:
                 crop, selected_currency = state.queue.get(timeout=2)
@@ -145,204 +202,262 @@ def start_worker(state: ScanState, reader):
                 continue
             try:
                 number, raw = scan_crop(crop, selected_currency, reader)
-                if number is None:
-                    previous, repetitions = None, 0
-                    continue
-                if number == previous:
-                    repetitions += 1
-                else:
-                    previous, repetitions = number, 1
-                # Tek bir bulanık karede yanlış fiyat yakalamamak için
-                # 2 arka arkaya benzer okuma bekle.
-                if repetitions >= 2:
-                    with state.lock:
+                now = time.monotonic()
+                with state.lock:
+                    if selected_currency != state.currency:
+                        continue
+                    if number is None:
+                        if now - state.proposed_at > 5:
+                            state.proposed = None
+                            state.proposed_hits = 0
+                        if state.price is None:
+                            state.status = "Henüz net fiyat yok. Biraz yaklaştırıp sabit tut."
+                        continue
+
+                    if number != state.proposed or (now - state.proposed_at > 5):
+                        state.proposed = number
+                        state.proposed_hits = 1
+                    else:
+                        state.proposed_hits += 1
+                    state.proposed_at = now
+
+                    # İlk tanıma iki tutarlı OCR okuması gerektirir.
+                    # Daha önce onaylı fiyat varken onu değiştirmek için üç okuma gerekir.
+                    required_hits = 2 if state.price is None else 3
+                    if number == state.price:
+                        state.status = "✅ Fiyat doğrulandı"
+                    elif state.proposed_hits >= required_hits:
                         state.price = number
                         state.raw = raw
-                        state.status = "Fiyat okundu."
+                        state.status = "✅ Fiyat doğrulandı"
+                    else:
+                        state.status = (
+                            f"{format_tr(number, 0 if selected_currency in ZERO_DECIMAL else 2)} "
+                            f"{selected_currency} doğrulanıyor "
+                            f"({state.proposed_hits}/{required_hits})…"
+                        )
             except Exception as exc:
                 with state.lock:
                     state.status = f"OCR hatası: {type(exc).__name__}"
 
-    threading.Thread(target=run, daemon=True, name="ocr_worker").start()
+    threading.Thread(target=run, name="price_scanner_ocr_worker", daemon=True).start()
 
 
-st.title("🔎 Price Scanner")
-st.caption("Ülkeni seç → kamera ile fiyatı oku → güncel kur ve tax free tahminini TL olarak gör.")
-
+# --- Ülke ve kur: sık kullanılan bilgiler yukarıda, ayrıntılar en altta ---
+st.markdown('<div class="ps-topline">🔎 Price Scanner</div>', unsafe_allow_html=True)
 country = st.selectbox(
-    "🌍 Nereye seyahat ediyorsun?",
+    "Nereye seyahat ediyorsun?",
     list(COUNTRIES),
-    format_func=lambda key: COUNTRIES[key].label,
-    index=0,
+    format_func=lambda name: COUNTRIES[name].label,
+    label_visibility="collapsed",
 )
 rule = COUNTRIES[country]
 currency = rule.currency
-st.caption(f"Para birimi otomatik seçildi: **{currency}** · Standart KDV: **%{rule.vat}**")
-
-with st.expander("ℹ️ Bu ülkenin tax free kuralı"):
-    st.write(rule.summary)
-    st.write(rule.eligibility_note)
-    st.caption(f"Kuralların son manuel kontrolü: {RULES_REVIEWED}. Vergi kuralları canlı API ile yenilenmiyor.")
-    for i, source_url in enumerate(rule.sources, 1):
-        st.markdown(f"[Resmî kaynak {i}]({source_url})")
-
-with st.expander("⚙️ Gelişmiş: iade tahminini düzenle"):
-    use_custom = st.checkbox(
-        "Tahmini net iadeyi kendim gireyim",
-        value=False,
-        disabled=rule.method == "unavailable",
-        help="Gerçek fişte yazan efektif iade oranını biliyorsan buradan değiştirebilirsin.",
-    )
-    theoretical_pct = rule.vat / (Decimal("100") + rule.vat) * Decimal("100")
-    custom_pct = st.number_input(
-        "Etiket fiyatının yüzde kaçı iade edilecek?",
-        min_value=0.0, max_value=float(theoretical_pct),
-        value=float(rule.estimated_net_pct or theoretical_pct),
-        step=0.1,
-        disabled=not use_custom or rule.method == "unavailable",
-    )
-    override_pct = Decimal(str(custom_pct)) if use_custom else None
-
-if st.button("🔄 Güncel kuru yeniden sorgula", use_container_width=True):
-    fetch_fx.clear()
-    st.rerun()
 
 try:
     fx, fx_date = fetch_fx(currency)
-except requests.RequestException:
-    st.error("Online döviz kuruna ulaşılamadı. İnternet bağlantını kontrol edip tekrar dene. Manuel/eski kur kullanılmıyor.")
-    st.stop()
-except (KeyError, ValueError, TypeError):
-    st.error("Kur servisinden beklenmeyen bir cevap geldi; dönüşüm yapılmadı.")
+except (requests.RequestException, KeyError, ValueError, TypeError):
+    st.error("Güncel online kura erişilemedi; yanlış veya eski kurla hesaplama yapılmıyor.")
     st.stop()
 
-st.metric(f"Güncel referans kur · 1 {currency}", f"{format_tr(fx, 6)} TL")
-if currency in ZERO_DECIMAL:
-    st.caption(f"1.000 {currency} = {format_tr(fx * 1000, 2)} TL")
-st.caption(f"Frankfurter · Kur tarihi: **{fx_date}** · 15 dakikada bir yeniden sorgulanabilir. Bu piyasa referans kurudur, kartının kesin alış kuru değildir.")
-
-manual = st.number_input(
-    f"Gerekirse fiyatı elle düzelt ({currency}; 0 = kamera)",
-    min_value=0.0, value=0.0, step=1000.0 if currency in ZERO_DECIMAL else 10.0,
+# Ekranda yazan fx ile TL hesaplamasında kullanılan fx AYNI Decimal nesnesidir.
+st.markdown(
+    '<div class="ps-rate">'
+    f'💱 <strong>1 {html.escape(currency)} = {html.escape(format_fx_exact(fx))} TL</strong>'
+    f'<div class="ps-meta">Frankfurter · {html.escape(fx_date)} referans kuru · 15 dk önbellek</div>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
-if "scanner_state" not in st.session_state:
-    st.session_state.scanner_state = ScanState()
-state: ScanState = st.session_state.scanner_state
+if "scanner_state_v3" not in st.session_state:
+    st.session_state.scanner_state_v3 = ScanState()
+state: ScanState = st.session_state.scanner_state_v3
 
 with state.lock:
-    if state.currency != currency or state.country != country:
+    if state.country != country or state.currency != currency:
+        state.country, state.currency = country, currency
         state.price = None
         state.raw = ""
-        state.currency = currency
-        state.country = country
+        state.proposed = None
+        state.proposed_hits = 0
+        state.status = "Ülke değişti. Yeni para birimi için fiyatı okut."
+        # Ülke değişince önceden kalan OCR karelerini temizle.
+        while not state.queue.empty():
+            try:
+                state.queue.get_nowait()
+            except Empty:
+                break
 
-mode = st.radio("Tarama modu", ["Canlı kamera", "Fotoğraf çek"], horizontal=True)
+mode = st.radio("Tarama şekli", ["Canlı kamera", "Fotoğraf çek"], horizontal=True, label_visibility="collapsed")
 
 if mode == "Canlı kamera":
-    # İlk başlatmada OCR modelinin yüklenmesi birkaç saniye sürebilir.
     reader = load_reader()
     start_worker(state, reader)
 
     def video_callback(frame: av.VideoFrame) -> av.VideoFrame:
+        # SENDONLY: Tarayıcı gerçek kamera önizlemesini kendi çizer, sunucu dönüşünü beklemez.
+        now = time.monotonic()
+        with state.lock:
+            if now - state.last_frame < OCR_INTERVAL_SECONDS:
+                return frame
+            state.last_frame = now
+            current_currency = state.currency
         img = frame.to_ndarray(format="bgr24")
         x1, y1, x2, y2 = center_region(img)
-        now = time.monotonic()
-        if now - state.last_frame > 0.95:
-            state.last_frame = now
-            item = (img[y1:y2, x1:x2].copy(), currency)
-            try:
-                state.queue.put_nowait(item)
-            except Full:
-                # İşleme yetişemiyorsak yeni kareyi at; kamera donmasın.
-                pass
-
-        # Ekranın çerçeve dışındaki kısmını karart.
-        dark = (img * 0.42).astype(np.uint8)
-        dark[y1:y2, x1:x2] = img[y1:y2, x1:x2]
-        img = dark
-        color = (120, 240, 100)  # BGR açık yeşil
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, max(2, img.shape[1] // 220))
-        cv2.putText(img, "PRICE SCAN", (x1, max(26, y1 - 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-        with state.lock:
-            detected = state.price
-        if detected is not None:
-            cv2.putText(img, f"{detected:,.0f} {currency}",
-                        (x1, min(img.shape[0] - 16, y2 + 35)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+        enqueue_fresh(state, (img[y1:y2, x1:x2].copy(), current_currency))
+        return frame
 
     webrtc_streamer(
-        key="price-scan-live",
-        mode=WebRtcMode.SENDRECV,
+        key="price-scanner-local-compact-v3",
+        mode=WebRtcMode.SENDONLY,
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={
-            "video": {"facingMode": {"ideal": "environment"}},
+            "video": {
+                "facingMode": {"ideal": "environment"},
+                "width": {"ideal": 960},
+                "height": {"ideal": 720},
+                "frameRate": {"ideal": 24, "max": 30},
+            },
             "audio": False,
+        },
+        video_html_attrs={
+            "autoPlay": True,
+            "controls": False,
+            "muted": True,
+            "style": {
+                "width": "100%",
+                "height": "225px",
+                "objectFit": "cover",
+                "border": "2px solid #43d790",
+                "borderRadius": "10px",
+                "background": "#121212",
+            },
         },
         video_frame_callback=video_callback,
         async_processing=True,
     )
-    st.caption("Kamerada START'e basın. Çerçeve dışı karartılır; sadece yeşil alan taranır. Ön kamera açılırsa cihaz seçiminden arka kamerayı seçin.")
-
+    st.markdown(
+        '<div class="ps-tip">Yeşil çerçevenin ortasındaki fiyatı 2–3 saniye sabit tut · '
+        'OCR iki okumayla doğrular, fiyat değişimini üç okumayla doğrular.</div>',
+        unsafe_allow_html=True,
+    )
 else:
-    image_file = st.camera_input("Fiyatı ortadaki kutuya getirip fotoğraf çek")
+    image_file = st.camera_input("Fiyatı ortalayarak fotoğraf çek")
     if image_file is not None:
-        img_pil = Image.open(BytesIO(image_file.getvalue())).convert("RGB")
-        img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+        pil = Image.open(BytesIO(image_file.getvalue())).convert("RGB")
+        img = cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
         x1, y1, x2, y2 = center_region(img)
         cropped = img[y1:y2, x1:x2]
-        st.image(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB), caption="Taranan orta bölge", use_container_width=True)
+        # Fotoğraf modunda kullanıcı manuel çektiği için ilk bölgede tek okuma yeterli;
+        # okunamazsa tam kareyi de dener. Canlı kamerada iki/üç teyit korunur.
         detected, raw = scan_crop(cropped, currency, load_reader())
+        if detected is None:
+            detected, raw = scan_crop(img, currency, load_reader())
         if detected is not None:
             with state.lock:
                 state.price, state.raw = detected, raw
-            st.success(f"Algılanan fiyat: {format_tr(detected, 0 if currency in ZERO_DECIMAL else 2)} {currency}")
+                state.status = "✅ Fotoğraftan fiyat okundu"
         else:
-            st.warning("Ortadaki alanda bir fiyat okunamadı. Daha yakından ve ışıkta tekrar deneyin.")
+            st.warning("Fiyat bulunamadı; daha yakından, aydınlıkta tekrar çek.")
 
 
 @st.fragment(run_every="1s")
 def show_results():
     with state.lock:
-        scanned = state.price
-        raw = state.raw
-        status = state.status
+        scanned, raw, status = state.price, state.raw, state.status
 
-    amount = Decimal(str(manual)) if manual > 0 else scanned
-    if amount is None:
-        st.info(status)
+    # OCR henüz bir fiyat bulamadıysa da manuel fiyatın kullanılabilmesi gerekir.
+    manual_value = Decimal(str(st.session_state.get(f"ps_manual_{currency}", 0.0)))
+    if scanned is None and manual_value <= 0:
+        st.markdown(f'<div class="ps-status">{html.escape(status)}</div>', unsafe_allow_html=True)
         return
 
-    calc = estimate_refund(amount, rule, override_pct=override_pct)
-    after_tax = amount - calc.refund
-    original_tl = amount * fx
-    after_tax_tl = after_tax * fx
-    saved_tl = calc.refund * fx
+    # Fiyat elle girilmişse, OCR'den gelen veriyi silmeden bu tutarı hesapla.
+    amount = manual_value if manual_value > 0 else scanned
+    calc = estimate_refund(amount, rule, override_pct=override_pct_value())
+    initial_tl = amount * fx
+    discounted_tl = (amount - calc.refund) * fx
+    saving_tl = calc.refund * fx
+    amount_str = format_tr(amount, 0 if currency in ZERO_DECIMAL else 2)
+    mode_label = "✏️ Elle girilen" if manual_value > 0 else "✅ Okunan"
 
-    st.divider()
-    st.caption(("Manuel tutar" if manual > 0 else "Kameradan okunan") + f": {format_tr(amount, 0 if currency in ZERO_DECIMAL else 2)} {currency}" + (f" (OCR: {raw})" if raw and manual == 0 else ""))
-    st.metric("Normal fiyat (TL)", f"{format_tr(original_tl)} TL")
     if calc.status == "maximum":
-        st.metric("Teorik tax free sonrası (en iyi senaryo)", f"{format_tr(after_tax_tl)} TL")
-        st.caption("Bu tutar iade komisyonları düşülmeden hesaplanmıştır, fiilî tutar genellikle daha yüksek olur.")
+        tax_label = "Tax free teorik (TL)"
     elif calc.status == "estimated":
-        st.metric("Tahmini tax free sonrası (TL)", f"{format_tr(after_tax_tl)} TL")
-        st.caption("Net iade varsayımıdır; gerçek oran işlem ve iade operatörüne bağlıdır.")
+        tax_label = "Tax free sonrası (TL)"
     elif calc.status == "ineligible":
-        st.metric("Tax free sonrası (alt sınır sağlanmadı)", f"{format_tr(original_tl)} TL")
-        st.warning("Fiyat, kayıtlı tax free alışveriş eşiğinin altında. Aynı fişte farklı ürünler varsa toplam tutar eşiği sağlayabilir.")
+        tax_label = "Tax free eşiği altında"
     else:
-        st.metric("Tax free sonrası (genel iade yok)", f"{format_tr(original_tl)} TL")
-    st.caption(
-        f"İade ({'teorik üst sınır' if calc.status == 'maximum' else 'tahmin'}): "
-        f"{format_tr(calc.refund, 0 if currency in ZERO_DECIMAL else 2)} {currency} "
-        f"(%{format_tr(calc.pct_of_price, 2)}) ≈ {format_tr(saved_tl)} TL"
+        tax_label = "Vergi iadesi yok (TL)"
+
+    st.markdown(
+        f'<div class="ps-detected">{mode_label}: {html.escape(amount_str)} {html.escape(currency)}'
+        f' <span style="font-weight:400;color:#888;font-size:.75rem;">· {html.escape(status) if manual_value <= 0 else "manuel tutar"}</span></div>'
+        '<div class="ps-values">'
+        '<div class="ps-value">'
+        '<div class="ps-value-label">Normal fiyat (TL)</div>'
+        f'<div class="ps-value-number">{html.escape(format_tr(initial_tl))} TL</div>'
+        '</div>'
+        '<div class="ps-value">'
+        f'<div class="ps-value-label">{html.escape(tax_label)}</div>'
+        f'<div class="ps-value-number">{html.escape(format_tr(discounted_tl))} TL</div>'
+        '</div>'
+        '</div>'
+        '<div class="ps-saving">'
+        f'Tahmini iade: {html.escape(format_tr(calc.refund, 0 if currency in ZERO_DECIMAL else 2))} '
+        f'{html.escape(currency)} = {html.escape(format_tr(saving_tl))} TL'
+        '</div>',
+        unsafe_allow_html=True,
     )
-    if country == "Güney Kore" and amount >= Decimal("1000000"):
-        st.info("Bu fiş Kore'deki anında iade üst sınırının dışında; uygun alışverişlerde daha sonra iade süreci gerekebilir.")
+    if calc.status == "maximum":
+        st.caption("Teorik maksimumdur; iade operatörü kesinti yapabilir.")
+    elif calc.status == "ineligible":
+        st.caption("Tek ürün tutarı iade alt sınırında değil; fiş toplamı farklı olabilir.")
+    elif calc.status == "estimated":
+        st.caption("Vergi iadesi tahminidir; mağaza ve iade operatörüne göre değişebilir.")
+
+
+# İade oranı opsiyonel gelişmiş ayar. Widget değeri fragment'ten okunabilsin diye
+# varsayılanı Session State'te tutuyoruz; uygulama ilk kez çalışırken de hazır.
+def override_pct_value() -> Decimal | None:
+    enabled = st.session_state.get(f"ps_custom_enabled_{country}", False)
+    if not enabled:
+        return None
+    return Decimal(str(st.session_state.get(f"ps_custom_pct_{country}", 0.0)))
 
 
 show_results()
-st.caption("⚠️ Döviz kuru online güncellenir; tax free ülke kuralları uygulamadaki statik bilgilerden gelir. Ürün ve mağaza uygunluğu, fiş toplamı, iade komisyonları ve bankanın kart kuru nedeniyle fiilî tutar değişebilir.")
+
+with st.expander("⚙️ Fiyat düzeltme, kur yenileme ve tax free ayrıntıları"):
+    typed = st.number_input(
+        f"Fiyatı elle gir ({currency}) — 0 = kamerayı kullan",
+        min_value=0.0, value=0.0,
+        step=1000.0 if currency in ZERO_DECIMAL else 10.0,
+        key=f"ps_manual_{currency}",
+    )
+    if st.button("🔄 Kuru güncelle", use_container_width=True):
+        fetch_fx.clear()
+        st.rerun()
+    st.caption("Para birimi otomatik belirlenir. Frankfurter günlük referans kurudur; banka/kart kuru farklı olabilir.")
+    st.write(rule.summary)
+    st.write(rule.eligibility_note)
+    st.caption(f"Tax free kurallarının manuel kontrolü: {RULES_REVIEWED}.")
+    for index, source in enumerate(rule.sources, 1):
+        st.markdown(f"[Tax free resmî kaynak {index}]({source})")
+    max_pct = float(rule.vat / (Decimal("100") + rule.vat) * Decimal("100"))
+    st.checkbox(
+        "Tahmini net iadeyi elle değiştirmek istiyorum",
+        key=f"ps_custom_enabled_{country}",
+        disabled=rule.method == "unavailable",
+    )
+    st.number_input(
+        "Etiket fiyatının yüzde kaçı iade?",
+        min_value=0.0,
+        max_value=max_pct,
+        value=float(rule.estimated_net_pct or Decimal(str(max_pct))),
+        step=0.1,
+        key=f"ps_custom_pct_{country}",
+        disabled=not st.session_state.get(f"ps_custom_enabled_{country}", False) or rule.method == "unavailable",
+    )
+
+st.caption("Online referans kur ve tahmini tax free. Ürün, fiş, operatör kesintisi veya kart kuru nedeniyle gerçek tutar değişebilir.")
