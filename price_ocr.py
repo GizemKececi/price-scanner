@@ -366,7 +366,12 @@ def _suspect(candidate: Candidate, currency: str, results) -> bool:
         return True
     if currency in ZERO_DECIMAL and not candidate.currency_near and re.fullmatch(r"1\d{1,2}[,.]\d{3}",candidate.raw):
         return True  # ₩ is sometimes read as a leading 1.
-    return (bool(re.search(r"[%％]",text)) and not candidate.currency_near and
+    # An independent discount token ("28% 72,000 WON") must NOT poison the
+    # separate 72,000 price. Only suspect concatenation when the OCR output
+    # contains a percentage yet offers no independently parsed percent number.
+    has_percent = bool(re.search(r"[%％]", text))
+    percent_is_separate = bool(re.search(r"(?:^|\s)[0-9]{1,3}\s*[%％]\s+", text))
+    return (has_percent and not percent_is_separate and not candidate.currency_near and
             re.match(r"^[0-9]{5,}$",raw_digits) is not None)
 
 

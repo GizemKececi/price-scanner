@@ -30,8 +30,8 @@ st.set_page_config(page_title="Price Scanner", page_icon="🔎", layout="centere
 
 # Görünür kamera alanı kısa ve yataydır; burası OCR'de kullanılan merkez bant.
 # iPhone'un dikey kamera görüntüsü önizlemede object-fit: cover ile ortadan kırpılır.
-OCR_X_MIN, OCR_X_MAX = 0.24, 0.76
-OCR_Y_MIN, OCR_Y_MAX = 0.35, 0.65
+OCR_X_MIN, OCR_X_MAX = 0.18, 0.82
+OCR_Y_MIN, OCR_Y_MAX = 0.39, 0.61
 ZERO_DECIMAL = {"KRW", "JPY"}
 
 st.markdown(
@@ -258,9 +258,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "scanner_state_v10" not in st.session_state:
-    st.session_state.scanner_state_v10 = ScanState()
-state: ScanState = st.session_state.scanner_state_v10
+if "scanner_state_v11" not in st.session_state:
+    st.session_state.scanner_state_v11 = ScanState()
+state: ScanState = st.session_state.scanner_state_v11
 
 with state.lock:
     if state.country != country or state.currency != currency:
@@ -303,7 +303,7 @@ CAMERA_CSS = """
 .ps-camera-wrap {width:100%;height:225px;position:relative;overflow:hidden;
   background:#111;border-radius:10px;border:1px solid #444;}
 #ps-local-video {width:100%;height:100%;object-fit:cover;display:block;}
-#ps-guide {pointer-events:none;position:absolute;left:24%;right:24%;top:35%;bottom:35%;
+#ps-guide {pointer-events:none;position:absolute;left:18%;right:18%;top:39%;bottom:39%;
   transition:left .18s,right .18s,top .18s,bottom .18s;
   border:2px solid #4be49a;border-radius:8px;box-shadow:0 0 0 800px rgba(0,0,0,.26);}
 #ps-guide.wide {left:11%;right:11%;top:28%;bottom:28%;}
@@ -368,11 +368,11 @@ export default function (component) {
     const sh = Math.max(1, Math.min(vh - sy, gh));
     // Kırmızı/tırtıklı farklı fontlarda rakam çizgileri korunabilsin.
     // Smaller JPEG: faster phone->server upload and faster CPU recognition.
-    const factor = Math.min(1, 760 / sw);
+    const factor = Math.min(1, 960 / sw);
     canvas.width = Math.max(1, Math.floor(sw * factor));
     canvas.height = Math.max(1, Math.floor(sh * factor));
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-    const jpeg = canvas.toDataURL('image/jpeg', 0.80);
+    const jpeg = canvas.toDataURL('image/jpeg', 0.90);
     component.setTriggerValue('frame', {image:jpeg.split(',')[1], guide:guide.classList.contains('wide') ? 'wide' : 'tight'});
     status.textContent = 'Tarama açık';
   }
@@ -419,7 +419,7 @@ if mode == "Canlı kamera":
     start_worker(state, reader)
 
     def on_browser_frame():
-        payload = st.session_state.get("ps_browser_cam_v10")
+        payload = st.session_state.get("ps_browser_cam_v11")
         # Components v2 değerleri Streamlit sürümüne göre dict veya
         # attribute erişimli sonuç nesnesi olabiliyor.
         if isinstance(payload, dict):
@@ -455,18 +455,18 @@ if mode == "Canlı kamera":
             pass
 
     local_camera = st.components.v2.component(
-        "price_scanner_browser_camera_v10",
+        "price_scanner_browser_camera_v11",
         html=CAMERA_HTML, css=CAMERA_CSS, js=CAMERA_JS,
     )
     local_camera(
-        key="ps_browser_cam_v10",
+        key="ps_browser_cam_v11",
         on_frame_change=on_browser_frame,
         height=282,
     )
     st.markdown(
-        '<div class="ps-tip">Fiyatı tek başına <strong>dar yeşil kutunun</strong> ortasına getir. '
-        'İndirim oranını, eski fiyatı ve yorumları kutunun dışında bırak. '
-        'Uzun bir tutar sığmazsa ↔ Alanı genişlet seçeneğini kullan.</div>',
+        '<div class="ps-tip">Fiyatın <strong>tüm rakamlarını</strong> yeşil bant içine sığdır; kenarda rakam kalmasın. '
+        'Üstteki eski fiyat ile alttaki yorumları dışarıda bırak. '
+        'Uzun tutar sığmazsa ↔ Alanı genişlet seçeneğini kullan. Birim adı hesaba katılmaz.</div>',
         unsafe_allow_html=True,
     )
 else:
@@ -572,6 +572,10 @@ with st.expander("⚙️ Fiyat düzeltme, kur yenileme ve tax free ayrıntılar�
         step=1000.0 if currency in ZERO_DECIMAL else 10.0,
         key=f"ps_manual_{currency}",
     )
+    with state.lock:
+        debug_raw = state.last_ocr_raw
+        debug_ms = state.ocr_elapsed_ms
+    st.caption(f"OCR'nin son seçtiği rakam: {debug_raw or 'Henüz yok'} · İşleme süresi: {debug_ms/1000:.1f} sn")
     if st.button("🔄 Kuru güncelle", use_container_width=True):
         fetch_fx.clear()
         st.rerun()
