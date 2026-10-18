@@ -5,7 +5,7 @@ from decimal import Decimal
 import numpy as np
 import cv2
 
-from price_ocr import _candidates, _has_strikethrough, parse_amount, scan_crop
+from price_ocr import _candidates, _has_strikethrough, parse_amount, scan_crop, scan_crop_fast, _recognition_image
 
 
 def box(x, y, w, h):
@@ -17,7 +17,7 @@ class Reader:
         self.passes = list(passes)
         self.calls = 0
 
-    def readtext(self, image, detail=1, paragraph=False):
+    def readtext(self, image, detail=1, paragraph=False, **kwargs):
         i = min(self.calls, len(self.passes)-1)
         self.calls += 1
         return self.passes[i]
@@ -26,6 +26,46 @@ class Reader:
 class PriceOCRTests(unittest.TestCase):
     def setUp(self):
         self.image = np.zeros((400,1100,3),dtype=np.uint8)
+
+    def test_live_one_ocr_call_per_frame(self):
+        reader = Reader([(box(380,148,320,78), '9,950원', .94)])
+        result = scan_crop_fast(self.image, 'KRW', reader)
+        self.assertEqual(result.amount, Decimal(9950))
+        self.assertEqual(reader.calls,1)
+
+    def test_live_discount_and_review_not_concatenated(self):
+        image = np.full((400,1100,3), 220, dtype=np.uint8)
+        image[150:210,110:260] = (30,40,230)
+        image[155:218,360:630] = (28,28,28)
+        reader = Reader([(box(110,145,170,72), '50%', .98),
+                         (box(355,145,350,86), '9,950원~', .92),
+                         (box(390,327,245,36), '(99,999+)', .95)])
+        result = scan_crop_fast(image, 'KRW', reader)
+        self.assertEqual(result.amount, Decimal(9950))
+        self.assertEqual(reader.calls,1)
+
+    def test_live_no_giant_combined_price(self):
+        reader = Reader([(box(180,145,520,95), '509,995,021',.99)])
+        result = scan_crop_fast(self.image, 'KRW', reader)
+        self.assertIsNone(result.amount)
+        self.assertEqual(reader.calls,1)
+
+    def test_live_struck_old_price_only(self):
+        reader = Reader([(box(200,150,320,80), '~~20,000원~~', .92)])
+        result = scan_crop_fast(self.image,'KRW',reader)
+        self.assertIsNone(result.amount)
+        self.assertEqual(reader.calls,1)
+
+    def test_live_bottom_review_digits_dont_become_price(self):
+        reader = Reader([(box(350,320,280,55), '99,999', .99)])
+        result = scan_crop_fast(self.image, 'KRW', reader)
+        self.assertIsNone(result.amount)
+        self.assertEqual(reader.calls,1)
+
+    def test_live_suspicious_won_not_confirmed(self):
+        reader = Reader([(box(310,150,420,90), '15,000', .94)])
+        result = scan_crop_fast(self.image,'KRW',reader)
+        self.assertIsNone(result.amount)
 
     def test_won_symbols_not_amount(self):
         self.assertEqual(parse_amount("5,000", "KRW"), Decimal("5000"))

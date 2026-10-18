@@ -1,47 +1,25 @@
-# Price Scanner — Ülke Seçimli Sürüm
+# Price Scanner v9 — hızlı ve temkinli canlı tarama
 
-Streamlit + WebRTC + EasyOCR ile telefon kamerasından fiyat okuyarak TL karşılığını ve **ülkeye göre tax-free tahminini** hesaplayan örnek uygulama.
+Bu pakette `app.py`, `price_ocr.py`, `tax_rules.py`, `requirements.txt` ve test dosyaları var.
 
-## Nasıl çalışır?
+## Güncellemeler
 
-1. **Ülke seç:** Güney Kore, Japonya, Fransa, Almanya, İtalya, Tayland veya Birleşik Krallık. Para birimi otomatik seçilir.
-2. **Kur otomatik gelir:** Frankfurter API, `https://api.frankfurter.dev/v2/rate/KRW/TRY` gibi bir endpoint üzerinden **online** günlük referans kurunu getirir. Tarihi ve 1 birimin TL karşılığı gösterilir. Kur 15 dakika cache'lenir; elle yenileme düğmesi vardır. Canlı borsa tick verisi değil, günlük güncellenen referans kurdur. İnternet yoksa yanlış sonuç üretmemek için hesap yapılmaz.
-3. **Tax free ülkeden seçilir:** Ülke kuralları `tax_rules.py` içinde kaynak URL'leriyle birlikte saklanır. **Tax free kuralları canlı API ile çekilmez**, dönemsel kontrol gerektirir (son kontrol: 2026-10-17). Genel amaçlı ve her operatör için kesin net iade döndüren ücretsiz bir servis varsayılmamıştır.
-4. **Kamerayı fiyata tut:** Ortadaki yeşil çerçevede en uzun rakam dizisi aranır. Birden fazla karede tutarlı fiyat elde edince TL tutarları görüntülenir. Yanlışsa manuel tutar girilebilir.
+- **Canlı kamera:** Her kare için en çok **tek** EasyOCR çalıştırılır. v8'in bazı kareleri iki kez OCR'den geçirmesi kaldırıldı. Sorunlu karelerde ikinci filtre aynı kareyi bloklamak yerine başka bir kameradan gelen kareye uygulanır.
+- **Daha küçük işlem görüntüsü:** Kameradan giden JPEG en fazla 880 piksel genişlik ve kalite 0.80; OCR hızlı modda en fazla 800 piksel kullanır. Görünür kamera önizlemesi canlı kalır.
+- **Kamera sıklığı:** 1550 ms yerine 1000 ms aralıklarla görüntü gönderilir. Aradaki eski kareler kuyrukta birikmez.
+- **Fiyat seçimi:** İndirim yüzdeleri, çizili eski fiyatlar ve yorum sayıları rakama eklenmez. Örnek `%50 / 9,950원 / 20,000원 (üstü çizili) / ★4.9 (99,999+)` için 9.950 seçilmesi hedeflenir.
+- **Kırmızı indirim filtresi:** Kırmızı 50% yazısının kenarlarındaki açık renk halesi de maskelenir; yanındaki siyah fiyat korunur. Fiyatın kendisi kırmızıysa, farklı sonraki karede normal OCR de kullanılır.
+- **Temkinli doğrulama:** Seçilen rakam iki ayrı kameradan gelen karede eşleşmedikçe hesaplamada kullanılmaz. Çok uzun birleşmiş diziler ve alttaki yorum sayıları onaylanmaz. Belirsizlikte son fiyatın yerine yanlış bir rakam yazılmaz.
+- **Diagnostik:** Ekranda son OCR işlem süresi görüntülenir (net fiyat bulunamadığında). Bu, sunucunun ne kadar süre harcadığını anlamaya yardımcı olur.
 
-## Önemli iade ayrımı
+## Yükleme
 
-- **Güney Kore:** Standart KDV %10, ancak KDV dahil etiketin içindeki vergi payı %9,09. Varsayılan **%7**, mağaza ve iade operatörü kesintilerini hesaba katmak için örnek tahmini efektif net iade yüzdesidir, resmî sabit oran değildir. 15.000 KRW minimum; anında iade 1 milyon KRW altında tek fiş ve 5 milyon KRW seyahat toplamı koşuluna bağlıdır.
-- **Japonya:** Standart KDV dahil fiyat için teorik geri alınabilecek pay 10/110 ≈ %9,09. Standart vergili alımlar için 5.000 JPY vergi hariç fiş eşiği (5.500 JPY vergi dahil). 1 Kasım 2026'da çıkışta gümrük teyidi sonrası iade sistemine geçilecektir. %8 indirimli vergili ürünler burada modellenmez.
-- **Fransa, Almanya, İtalya ve Tayland:** Ülkenin **standart KDV'sine** göre **teorik azami iade** hesaplanır; net iade değildir. Ürün, fiş eşiği, operatör komisyonları doğrulanmalı. Tayland için 2.000 THB mağaza-gün eşiği kullanılır; gerçek iade resmî iade tablosuna göre hesaplanabilir (gelecek sürüm).
-- **İngiltere, İskoçya, Galler:** Genel valizle çıkışta alışveriş KDV iadesi yok; Kuzey İrlanda farklıdır.
-
-## Kurulum
-
-Python 3.10+ önerilir.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Telefon için uygulamayı HTTPS adresinde (ör. Streamlit Community Cloud) yayınlayıp tarayıcıda aç; kamera iznini ver. `streamlit-webrtc` bazı ağlarda TURN sunucusu olmadan bağlantı kuramayabilir. Bu yüzden fotoğraf çekme modu da ekli. İlk EasyOCR çalışması model indirebilir.
+1. ZIP'i aç.
+2. GitHub deposunun **ana klasöründeki** `app.py`, `price_ocr.py`, `tax_rules.py`, `requirements.txt` dosyalarını yenileriyle değiştir. `price_ocr.py` dosyasını atlama.
+3. Streamlit Cloud'un yeni commit'i dağıtmasını bekle ve iPhone'da sayfayı yenile. `test_*.py` dosyaları isteğe bağlıdır, uygulama çalışması için gerekli değildir.
 
 ## Test
 
-```bash
-python -m unittest discover -v
-```
+`python -m unittest discover -p 'test_*.py'`
 
-## Dosyalar
-
-- `app.py`: Streamlit ve canlı kamera / OCR
-- `tax_rules.py`: ülke ayarları, vergi-iade kuralları, kaynaklar ve matematik
-- `test_tax_rules.py`: veri girmeden çalışan birim testleri
-- `requirements.txt`: paket listesi
-
-## Yayınlama
-
-Bu klasördeki `app.py`, `tax_rules.py`, `requirements.txt` ve isteğe bağlı `README.md` ile `.gitignore` dosyasını GitHub repository köküne yükleyin. Streamlit Community Cloud'da giriş dosyası `app.py` ve Python 3.12 seçin. İlk çalıştırmada EasyOCR modelleri indirilebilir. Canlı WebRTC kamerası bazı mobil ağlarda TURN ayarı gerektirebilir, o durumda Fotoğraf çek modunu kullanın.
+28 otomatik kod testi geçen senaryoları içerir; bu testler gerçek EasyOCR modeli veya iPhone kamerasının hızını **ölçmez**. İlk OCR model indirmesi / Streamlit Cloud CPU yükü hâlâ ilk taramayı geciktirebilir. Telefon üzerinde mutlaka gerçek etiketle kontrol edilmeli.

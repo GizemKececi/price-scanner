@@ -23,14 +23,14 @@ import streamlit as st
 from PIL import Image
 
 from tax_rules import COUNTRIES, RULES_REVIEWED, estimate_refund
-from price_ocr import scan_crop
+from price_ocr import scan_crop, scan_crop_fast
 
 st.set_page_config(page_title="Price Scanner", page_icon="🔎", layout="centered")
 
 # Görünür kamera alanı kısa ve yataydır; burası OCR'de kullanılan merkez bant.
 # iPhone'un dikey kamera görüntüsü önizlemede object-fit: cover ile ortadan kırpılır.
-OCR_X_MIN, OCR_X_MAX = 0.085, 0.915
-OCR_Y_MIN, OCR_Y_MAX = 0.32, 0.68
+OCR_X_MIN, OCR_X_MAX = 0.095, 0.905
+OCR_Y_MIN, OCR_Y_MAX = 0.33, 0.67
 ZERO_DECIMAL = {"KRW", "JPY"}
 
 st.markdown(
@@ -125,6 +125,9 @@ class ScanState:
         self.proposed_at = 0.0
         self.last_frame_received = 0.0
         self.last_ocr_at = 0.0
+        self.scan_attempt = 0
+        self.ocr_elapsed_ms = 0
+        self.last_attempted_price: Decimal | None = None
         self.frames_received = 0
         self.confirmed_at = 0.0
         self.status = "Kamerayı başlatıp fiyatı yeşil çerçevenin içine getir."
@@ -160,25 +163,30 @@ def start_worker(state: ScanState, reader):
             except Empty:
                 continue
             try:
-                reading = scan_crop(crop, selected_currency, reader)
+                begun = time.monotonic()
+                with state.lock:
+                    attempt = state.scan_attempt
+                reading = scan_crop_fast(crop, selected_currency, reader, attempt)
                 now = time.monotonic()
                 with state.lock:
                     if selected_currency != state.currency:
                         continue
                     state.last_ocr_at = now
+                    state.ocr_elapsed_ms = int((now - begun)*1000)
                     number, raw = reading.amount, reading.raw
+                    state.scan_attempt = (attempt + 1) % 3 if number is None else 0
                     if number is None:
                         # Bir süre net fiyat yoksa eski ürünün fiyatını gösterme.
                         if now - state.proposed_at > 7:
                             state.proposed = None
                             state.proposed_hits = 0
-                        if state.price is not None and now - state.confirmed_at > 9:
+                        if state.price is not None and now - state.confirmed_at > 5:
                             state.price = None
                             state.raw = ""
                         state.status = reading.note or "OCR net bir fiyat bulamadı; tekrar deniyor."
                         continue
 
-                    if number != state.proposed or now - state.proposed_at > 9:
+                    if number != state.proposed or now - state.proposed_at > 6:
                         # Başka fiyata geçildiğinde eski tutarı geçici olarak kaldır:
                         # ekran yeni ürünün fiyatını eskisiymiş gibi göstermesin.
                         if state.price is not None and number != state.price:
@@ -190,9 +198,8 @@ def start_worker(state: ScanState, reader):
                         state.proposed_hits += 1
                     state.proposed_at = now
 
-                    # Aynı OCR hatasını yeniden okumak tek başına kesin garanti
-                    # olamaz. Para simgesi önce OCR'de korundu, şüpheli 1xxxx
-                    # tutarlar kontrastlı görüntüyle çapraz kontrol edildi.
+                    # Farklı canlı karelerde iki bağımsız fiyat eşleşmesi şart.
+                    # Çelişkili veya birleşik sayılarda yanlış sonuç gösterme.
                     required_hits = 2
                     if number == state.price:
                         state.confirmed_at = now
@@ -243,9 +250,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "scanner_state_v8" not in st.session_state:
-    st.session_state.scanner_state_v8 = ScanState()
-state: ScanState = st.session_state.scanner_state_v8
+if "scanner_state_v9" not in st.session_state:
+    st.session_state.scanner_state_v9 = ScanState()
+state: ScanState = st.session_state.scanner_state_v9
 
 with state.lock:
     if state.country != country or state.currency != currency:
@@ -255,6 +262,7 @@ with state.lock:
         state.proposed = None
         state.proposed_hits = 0
         state.confirmed_at = 0.0
+        state.scan_attempt = 0
         state.status = "Ülke değişti. Yeni para birimi için fiyatı okut."
         # Ülke değişince önceden kalan OCR karelerini temizle.
         while not state.queue.empty():
@@ -285,7 +293,7 @@ CAMERA_CSS = """
 .ps-camera-wrap {width:100%;height:225px;position:relative;overflow:hidden;
   background:#111;border-radius:10px;border:1px solid #444;}
 #ps-local-video {width:100%;height:100%;object-fit:cover;display:block;}
-#ps-guide {pointer-events:none;position:absolute;left:8.5%;right:8.5%;top:18%;bottom:18%;
+#ps-guide {pointer-events:none;position:absolute;left:9.5%;right:9.5%;top:19%;bottom:19%;
   border:2px solid #4be49a;border-radius:8px;box-shadow:0 0 0 800px rgba(0,0,0,.26);}
 #ps-guide span {position:absolute;top:-1.35em;left:0;color:#5bf9ac;font-size:11px;
   font-weight:700;letter-spacing:.06em;text-shadow:0 1px 2px #000;}
@@ -345,13 +353,14 @@ export default function (component) {
     const sw = Math.max(1, Math.min(vw - sx, gw));
     const sh = Math.max(1, Math.min(vh - sy, gh));
     // Kırmızı/tırtıklı farklı fontlarda rakam çizgileri korunabilsin.
-    const factor = Math.min(1, 1600 / sw);
+    // Smaller JPEG: faster phone->server upload and faster CPU recognition.
+    const factor = Math.min(1, 880 / sw);
     canvas.width = Math.max(1, Math.floor(sw * factor));
     canvas.height = Math.max(1, Math.floor(sh * factor));
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-    const jpeg = canvas.toDataURL('image/jpeg', 0.88);
+    const jpeg = canvas.toDataURL('image/jpeg', 0.80);
     component.setTriggerValue('frame', jpeg.split(',')[1]);
-    status.textContent = 'Fiyat kontrol ediliyor…';
+    status.textContent = 'Tarama açık';
   }
 
   async function startCamera() {
@@ -371,8 +380,8 @@ export default function (component) {
       startBtn.hidden = true;
       stopBtn.hidden = false;
       status.textContent = 'Canlı kamera açık';
-      timer = setInterval(capture, 1550);
-      setTimeout(capture, 500);
+      timer = setInterval(capture, 1000);
+      setTimeout(capture, 250);
     } catch(err) {
       status.textContent = 'Kamera açılamadı: ' + (err?.name || 'izin veya tarayıcı');
       msg.textContent = 'Safari kamera iznini kontrol et. Gerekirse Fotoğraf çek modunu kullan.';
@@ -390,7 +399,7 @@ if mode == "Canlı kamera":
     start_worker(state, reader)
 
     def on_browser_frame():
-        payload = st.session_state.get("ps_browser_cam_v8")
+        payload = st.session_state.get("ps_browser_cam_v9")
         # Components v2 değerleri Streamlit sürümüne göre dict veya
         # attribute erişimli sonuç nesnesi olabiliyor.
         if isinstance(payload, dict):
@@ -413,11 +422,11 @@ if mode == "Canlı kamera":
             pass
 
     local_camera = st.components.v2.component(
-        "price_scanner_browser_camera_v8",
+        "price_scanner_browser_camera_v9",
         html=CAMERA_HTML, css=CAMERA_CSS, js=CAMERA_JS,
     )
     local_camera(
-        key="ps_browser_cam_v8",
+        key="ps_browser_cam_v9",
         on_frame_change=on_browser_frame,
         height=282,
     )
@@ -453,12 +462,14 @@ def override_pct_value() -> Decimal | None:
     return Decimal(str(st.session_state.get(f"ps_custom_pct_{country}", 0.0)))
 
 
-@st.fragment(run_every="1s")
+@st.fragment(run_every="0.7s")
 def show_results():
     with state.lock:
         scanned, raw, status = state.price, state.raw, state.status
         received, last_seen = state.frames_received, state.last_frame_received
         last_ocr = state.last_ocr_at
+        ocr_ms = state.ocr_elapsed_ms
+        proposed, proposed_hits = state.proposed, state.proposed_hits
     if mode == "Canlı kamera" and last_seen:
         wait = time.monotonic() - last_seen
         if wait > 9:
@@ -471,7 +482,7 @@ def show_results():
     if scanned is None and manual_value <= 0:
         st.markdown(f'<div class="ps-status">{html.escape(status)}</div>', unsafe_allow_html=True)
         if mode == "Canlı kamera" and received:
-            st.caption(f"Kameradan {received} kare alındı. Sunucu OCR durumunu yukarıda gösterir.")
+            st.caption(f"Kameradan {received} kare alındı · Son OCR: {ocr_ms/1000:.1f} sn" if ocr_ms else f"Kameradan {received} kare alındı; OCR bekleniyor")
         return
 
     # Fiyat elle girilmişse, OCR'den gelen veriyi silmeden bu tutarı hesapla.

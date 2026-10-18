@@ -1,4 +1,4 @@
-"""Price Scanner OCR v8: isolate a CURRENT price, not the longest number.
+"""Price Scanner OCR v9: isolate a CURRENT price, not the longest number.
 
 Symbols are contextual metadata only. Calculations use numeric text exclusively.
 A discount %, struck-through old price, star rating, review count, or SKU is
@@ -76,9 +76,14 @@ def parse_amount(raw: str, currency: str) -> Decimal | None:
     return Decimal(digits)
 
 
-def _recognition_image(bgr: np.ndarray, kind: str) -> np.ndarray:
+def _recognition_image(bgr: np.ndarray, kind: str, *, fast: bool = False) -> np.ndarray:
     height, width = bgr.shape[:2]
-    scale = min(1.55, 1180 / max(width, 1)) if width < 1180 else 1.0
+    # Previous versions upscaled almost every frame to 1180px, substantially
+    # slowing CPU-only EasyOCR. Live mode stays close to its input resolution.
+    if fast:
+        scale = min(1.0, 800 / max(width, 1))
+    else:
+        scale = min(1.20, 960 / max(width, 1))
     if kind == "original":
         img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     elif kind == "redless":
@@ -90,14 +95,19 @@ def _recognition_image(bgr: np.ndarray, kind: str) -> np.ndarray:
                     (red.astype(np.int16) > blue.astype(np.int16) + 18) &
                     (red > 65) & ((hsv[:, :, 0] < 15) | (hsv[:, :, 0] > 170)))
         img = bgr.copy()
+        # Red price badges have a pale antialiased outline. Remove the outline
+        # together with red ink so '50%' does not survive as white digits.
+        red_mask = cv2.dilate(red_mask.astype(np.uint8),
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(11,11))) > 0
         img[red_mask] = (245, 245, 245)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     else:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
         img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    if scale > 1:
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if scale != 1.0:
+        img = cv2.resize(img, None, fx=scale, fy=scale,
+                         interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
     return img
 
 
@@ -354,7 +364,7 @@ def _suspect(candidate: Candidate, currency: str, results) -> bool:
     raw_digits = re.sub(r"\D","",candidate.raw)
     if len(raw_digits) >= 7 and not candidate.currency_near:
         return True
-    if currency in ZERO_DECIMAL and re.fullmatch(r"1\d{1,2}[,.]\d{3}",candidate.raw):
+    if currency in ZERO_DECIMAL and not candidate.currency_near and re.fullmatch(r"1\d{1,2}[,.]\d{3}",candidate.raw):
         return True  # ₩ is sometimes read as a leading 1.
     return (bool(re.search(r"[%％]",text)) and not candidate.currency_near and
             re.match(r"^[0-9]{5,}$",raw_digits) is not None)
@@ -364,7 +374,8 @@ def scan_crop(bgr: np.ndarray, currency: str, reader) -> Reading:
     if bgr is None or not bgr.size:
         return Reading(None,note="Kameradan görüntü gelmedi")
     base = _recognition_image(bgr,"original")
-    results = reader.readtext(base,detail=1,paragraph=False)
+    results = reader.readtext(base,detail=1,paragraph=False, width_ths=.25,
+                              canvas_size=1024, mag_ratio=1.0)
     candidates = _candidates(results,currency,base.shape,base)
     primary, alternatives_a = _pick(candidates)
     red_black = _has_red_black_mix(bgr)
@@ -382,7 +393,8 @@ def scan_crop(bgr: np.ndarray, currency: str, reader) -> Reading:
     # visual treatment removes red discount labels without deleting black price.
     kind = "redless" if red_black else "contrast"
     second = _recognition_image(bgr,kind)
-    results2 = reader.readtext(second,detail=1,paragraph=False)
+    results2 = reader.readtext(second,detail=1,paragraph=False, width_ths=.25,
+                               canvas_size=1024, mag_ratio=1.0)
     candidates2 = _candidates(results2,currency,second.shape,second)
     secondary, alternatives_b = _pick(candidates2)
     if primary and secondary and primary.value == secondary.value:
@@ -411,3 +423,52 @@ def scan_crop(bgr: np.ndarray, currency: str, reader) -> Reading:
     if choices:
         return Reading(None,note="Eski fiyat, indirim veya yorum sayısı ayrıştırılamadı; biraz yaklaştır", alternatives=choices)
     return Reading(None,note="Güncel fiyat bulunamadı; fiyatı çerçevenin ortasına getir")
+
+
+def scan_crop_fast(bgr: np.ndarray, currency: str, reader, attempt: int = 0) -> Reading:
+    """ONE EasyOCR inference per live frame; never block to reread this frame.
+
+    A black price beside red discount text is read after suppressing red ink.
+    If uncertain, caller alternates preprocessing on a *new* camera frame.
+    Currency symbols and other glyphs are context, not numeric digits.
+    """
+    if bgr is None or not bgr.size:
+        return Reading(None, note="Kameradan görüntü gelmedi")
+    mixed = _has_red_black_mix(bgr)
+    if mixed:
+        kind = "redless" if attempt % 3 != 2 else "original"
+    else:
+        kind = "contrast" if attempt % 3 == 2 else "original"
+    image = _recognition_image(bgr,kind, fast=True)
+    # Tight grouping prevents separate discount and price glyphs joining.
+    results = reader.readtext(image, detail=1, paragraph=False, width_ths=.22,
+                              canvas_size=960, mag_ratio=1.0)
+    candidates = _candidates(results,currency,image.shape,image)
+    selected, rivals = _pick(candidates)
+    if selected is None:
+        if rivals:
+            return Reading(None, note="Birden çok rakam var; fiyatı ortaya getir", alternatives=rivals)
+        return Reading(None, note="Fiyat seçilemedi; merkeze yaklaştır")
+
+    # Never publish visually crossed out numbers, a suspiciously concatenated
+    # discount and price, or a low-confidence guess. The next frame can try a
+    # different visual treatment without doing a second slow OCR now.
+    threshold = .50 if selected.currency_near else .63
+    if selected.crossed or selected.confidence < threshold:
+        return Reading(None, note="Okuma belirsiz; yeniden deneniyor")
+    # User points the middle of the guide at the actual price. Lower rows
+    # without a currency hint are commonly star ratings or review counts,
+    # especially when OCR has dropped parentheses and '+' symbols.
+    if not selected.currency_near and (selected.bounds[1] + selected.bounds[3])*0.5 > image.shape[0]*0.77:
+        return Reading(None,note="Alt satır yorum sayısı olabilir; fiyatı ortala")
+    if mixed and kind == 'original' and len(re.sub(r'\D','',selected.raw)) >= 6:
+        return Reading(None, note="İndirim ile fiyat karışabilir; yeniden deneniyor")
+    if _suspect(selected,currency,results):
+        return Reading(None,note="Şüpheli rakam; yeniden kontrol ediliyor")
+    # Guard against a missing decimal/grouping separator creating concatenated
+    # six-plus digit numbers when the same frame contains several labels.
+    digits = re.sub(r'\D','',selected.raw)
+    if len(digits) >= 7 and not selected.currency_near:
+        return Reading(None, note="Birleşik rakam olabilir; fiyatı merkeze getir")
+    return Reading(selected.value, selected.raw, selected.confidence,
+                   note="Fiyat bulundu; ikinci kare ile kontrol ediliyor")
