@@ -1,25 +1,36 @@
-# Price Scanner v9 — hızlı ve temkinli canlı tarama
+# Price Scanner v10 — Tek Fiyat / Dar Alan
 
-Bu pakette `app.py`, `price_ocr.py`, `tax_rules.py`, `requirements.txt` ve test dosyaları var.
+Bu sürüm, canlı kamerada çok sayı bulunan tüm ürün ekranını okumak yerine tek bir fiyatı dar yeşil çerçevenin içinde okur.
 
-## Güncellemeler
+## Nasıl kullanılır?
 
-- **Canlı kamera:** Her kare için en çok **tek** EasyOCR çalıştırılır. v8'in bazı kareleri iki kez OCR'den geçirmesi kaldırıldı. Sorunlu karelerde ikinci filtre aynı kareyi bloklamak yerine başka bir kameradan gelen kareye uygulanır.
-- **Daha küçük işlem görüntüsü:** Kameradan giden JPEG en fazla 880 piksel genişlik ve kalite 0.80; OCR hızlı modda en fazla 800 piksel kullanır. Görünür kamera önizlemesi canlı kalır.
-- **Kamera sıklığı:** 1550 ms yerine 1000 ms aralıklarla görüntü gönderilir. Aradaki eski kareler kuyrukta birikmez.
-- **Fiyat seçimi:** İndirim yüzdeleri, çizili eski fiyatlar ve yorum sayıları rakama eklenmez. Örnek `%50 / 9,950원 / 20,000원 (üstü çizili) / ★4.9 (99,999+)` için 9.950 seçilmesi hedeflenir.
-- **Kırmızı indirim filtresi:** Kırmızı 50% yazısının kenarlarındaki açık renk halesi de maskelenir; yanındaki siyah fiyat korunur. Fiyatın kendisi kırmızıysa, farklı sonraki karede normal OCR de kullanılır.
-- **Temkinli doğrulama:** Seçilen rakam iki ayrı kameradan gelen karede eşleşmedikçe hesaplamada kullanılmaz. Çok uzun birleşmiş diziler ve alttaki yorum sayıları onaylanmaz. Belirsizlikte son fiyatın yerine yanlış bir rakam yazılmaz.
-- **Diagnostik:** Ekranda son OCR işlem süresi görüntülenir (net fiyat bulunamadığında). Bu, sunucunun ne kadar süre harcadığını anlamaya yardımcı olur.
+1. `Canlı kamera` seçip kamerayı aç.
+2. Fiyatı **tek başına** dar yeşil kutuya getir. Örneğin sadece `28,600원~` görünsün; `%28`, çizili `39,900원`, puan ve yorumlar kutunun dışında kalsın.
+3. Fiyat uzun ve kutuya sığmıyorsa `↔ Alanı genişlet` düğmesine dokun. Geniş alan modunda yüzde, çizili fiyat ve yorum sayısı ayıklama kuralları uygulanır.
+4. Para sembolleri rakam olarak hesaplanmaz; nokta/virgül ayracı ve rakamlar hesaplanır.
 
-## Yükleme
+## Neler değişti?
 
-1. ZIP'i aç.
-2. GitHub deposunun **ana klasöründeki** `app.py`, `price_ocr.py`, `tax_rules.py`, `requirements.txt` dosyalarını yenileriyle değiştir. `price_ocr.py` dosyasını atlama.
-3. Streamlit Cloud'un yeni commit'i dağıtmasını bekle ve iPhone'da sayfayı yenile. `test_*.py` dosyaları isteğe bağlıdır, uygulama çalışması için gerekli değildir.
+- Varsayılan çerçeve, önizlemenin %52 genişliğinde ve %30 yüksekliğinde; önceki sürümde yaklaşık %81 × %62 idi.
+- **Gerçekte OCR'ye giden fotoğraf, ekrandaki yeşil kutunun içidir**. Kamera görüntüsünün geri kalanı sunucuya gönderilmez.
+- Dar alanda hızlı tek satır tanıma için `EasyOCR.recognize` kullanılır. Metin algılama (`readtext`) yalnızca ilk iki deneme başarılı olmazsa sonraki karede devreye girer. Bir kare için iki ağır OCR çalıştırılmaz.
+- Her 850 ms'de güncel kare gönderilmeye çalışılır; kuyrukta eski kare biriktirilmez.
+- Aynı fiyatın farklı iki kamera karesinde okunması gerekir. Yeşil alan dar/geniş değişince eski sonuç temizlenir.
+- Fotoğraf modunda da orta alana kırpılır; yanlış sayı alma riski yaratan tüm fotoğrafı yeniden tarama kaldırıldı.
+- Canlı kamera kararlı olduğunda kullanılacak hedef süre **5 saniye**. Ağ, sunucu yoğunluğu, ilk model yüklemesi, telefon ve görüntü kalitesi yüzünden kesin süre garantisi verilemez.
 
-## Test
+## GitHub / Streamlit kurulumu
 
-`python -m unittest discover -p 'test_*.py'`
+ZIP içindeki aşağıdaki dosyaları aynı depodaki ana klasöre koy veya eskileriyle değiştir:
 
-28 otomatik kod testi geçen senaryoları içerir; bu testler gerçek EasyOCR modeli veya iPhone kamerasının hızını **ölçmez**. İlk OCR model indirmesi / Streamlit Cloud CPU yükü hâlâ ilk taramayı geciktirebilir. Telefon üzerinde mutlaka gerçek etiketle kontrol edilmeli.
+- `app.py`
+- `price_ocr.py`
+- `price_tight.py` **(yeni, mutlaka yükle)**
+- `tax_rules.py`
+- `requirements.txt`
+
+Streamlit Cloud uygulamanın başlangıç dosyası `app.py` olarak kalmalı. `test_*.py` dosyaları yalnızca test amacıyla eklenmiştir.
+
+## Geliştirici testleri
+
+`python -m unittest discover -p 'test_*.py'` komutuyla metin ayrıştırma, seçilen fiyat, simge/yüzde/yorum, tek OCR çağrısı ve tax-free senaryoları kontrol edilir. Bu testler gerçek kamera hızını ya da EasyOCR'nin görüntüdeki doğruluğunu garanti etmez.

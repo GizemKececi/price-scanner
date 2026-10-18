@@ -24,13 +24,14 @@ from PIL import Image
 
 from tax_rules import COUNTRIES, RULES_REVIEWED, estimate_refund
 from price_ocr import scan_crop, scan_crop_fast
+from price_tight import scan_tight_fast
 
 st.set_page_config(page_title="Price Scanner", page_icon="🔎", layout="centered")
 
 # Görünür kamera alanı kısa ve yataydır; burası OCR'de kullanılan merkez bant.
 # iPhone'un dikey kamera görüntüsü önizlemede object-fit: cover ile ortadan kırpılır.
-OCR_X_MIN, OCR_X_MAX = 0.095, 0.905
-OCR_Y_MIN, OCR_Y_MAX = 0.33, 0.67
+OCR_X_MIN, OCR_X_MAX = 0.24, 0.76
+OCR_Y_MIN, OCR_Y_MAX = 0.35, 0.65
 ZERO_DECIMAL = {"KRW", "JPY"}
 
 st.markdown(
@@ -53,7 +54,7 @@ st.markdown(
         border: 1px solid rgba(128,128,128,.25); border-radius: 12px; line-height: 1.55;
         margin-top:.12rem; margin-bottom:.16rem;}
       .ps-meta {color: #9a9a9a; font-size: .75rem; margin-top: .22rem;line-height:1.5;}
-      .ps-tip {font-size: .76rem; color: #888; margin-bottom: .1rem;}
+      .ps-tip {font-size: .78rem; color: #aaa; margin: .2rem 0 .25rem; line-height:1.5;}
       .ps-detected {font-size: .94rem; font-weight: 600; margin: .15rem 0 .36rem;}
       .ps-status {font-size: .82rem; color: #777; padding: .35rem .1rem;}
       .ps-values {display:grid; grid-template-columns:1fr 1fr; gap: .55rem; }
@@ -126,6 +127,9 @@ class ScanState:
         self.last_frame_received = 0.0
         self.last_ocr_at = 0.0
         self.scan_attempt = 0
+        self.guide_mode = "tight"
+        self.view_version = 0
+        self.last_ocr_raw = ""
         self.ocr_elapsed_ms = 0
         self.last_attempted_price: Decimal | None = None
         self.frames_received = 0
@@ -159,22 +163,26 @@ def start_worker(state: ScanState, reader):
     def run():
         while True:
             try:
-                crop, selected_currency = state.queue.get(timeout=2)
+                crop, selected_currency, guide_mode, version = state.queue.get(timeout=2)
             except Empty:
                 continue
             try:
                 begun = time.monotonic()
                 with state.lock:
                     attempt = state.scan_attempt
-                reading = scan_crop_fast(crop, selected_currency, reader, attempt)
+                reading = (scan_tight_fast(crop, selected_currency, reader, attempt)
+                           if guide_mode == "tight" else
+                           scan_crop_fast(crop, selected_currency, reader, attempt))
                 now = time.monotonic()
                 with state.lock:
-                    if selected_currency != state.currency:
+                    if selected_currency != state.currency or version != state.view_version:
                         continue
                     state.last_ocr_at = now
                     state.ocr_elapsed_ms = int((now - begun)*1000)
                     number, raw = reading.amount, reading.raw
-                    state.scan_attempt = (attempt + 1) % 3 if number is None else 0
+                    state.last_ocr_raw = raw or (str(reading.alternatives) if reading.alternatives else "")
+                    state.scan_attempt = ((1 if attempt == 0 else 0) if number is not None
+                                          else (attempt + 1) % 3)
                     if number is None:
                         # Bir süre net fiyat yoksa eski ürünün fiyatını gösterme.
                         if now - state.proposed_at > 7:
@@ -186,7 +194,7 @@ def start_worker(state: ScanState, reader):
                         state.status = reading.note or "OCR net bir fiyat bulamadı; tekrar deniyor."
                         continue
 
-                    if number != state.proposed or now - state.proposed_at > 6:
+                    if number != state.proposed or now - state.proposed_at > 3.5:
                         # Başka fiyata geçildiğinde eski tutarı geçici olarak kaldır:
                         # ekran yeni ürünün fiyatını eskisiymiş gibi göstermesin.
                         if state.price is not None and number != state.price:
@@ -250,9 +258,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "scanner_state_v9" not in st.session_state:
-    st.session_state.scanner_state_v9 = ScanState()
-state: ScanState = st.session_state.scanner_state_v9
+if "scanner_state_v10" not in st.session_state:
+    st.session_state.scanner_state_v10 = ScanState()
+state: ScanState = st.session_state.scanner_state_v10
 
 with state.lock:
     if state.country != country or state.currency != currency:
@@ -263,6 +271,7 @@ with state.lock:
         state.proposed_hits = 0
         state.confirmed_at = 0.0
         state.scan_attempt = 0
+        state.view_version += 1
         state.status = "Ülke değişti. Yeni para birimi için fiyatı okut."
         # Ülke değişince önceden kalan OCR karelerini temizle.
         while not state.queue.empty():
@@ -279,12 +288,13 @@ mode = st.radio("Tarama şekli", ["Canlı kamera", "Fotoğraf çek"], horizontal
 CAMERA_HTML = """
 <div class="ps-camera-wrap">
   <video id="ps-local-video" muted autoplay playsinline webkit-playsinline></video>
-  <div id="ps-guide"><span>FİYATI BURAYA GETİR</span></div>
+  <div id="ps-guide"><span>SADECE FİYATI HİZALA</span></div>
   <div id="ps-camera-message">Kamerayı başlatmak için düğmeye dokun.</div>
 </div>
 <div class="ps-controls">
   <button type="button" id="ps-start">📷 Kamerayı aç</button>
   <button type="button" id="ps-stop" hidden>■ Durdur</button>
+  <button type="button" id="ps-guide-size">↔ Alanı genişlet</button>
   <span id="ps-camera-status" role="status" aria-live="polite">Hazır</span>
 </div>
 """
@@ -293,8 +303,10 @@ CAMERA_CSS = """
 .ps-camera-wrap {width:100%;height:225px;position:relative;overflow:hidden;
   background:#111;border-radius:10px;border:1px solid #444;}
 #ps-local-video {width:100%;height:100%;object-fit:cover;display:block;}
-#ps-guide {pointer-events:none;position:absolute;left:9.5%;right:9.5%;top:19%;bottom:19%;
+#ps-guide {pointer-events:none;position:absolute;left:24%;right:24%;top:35%;bottom:35%;
+  transition:left .18s,right .18s,top .18s,bottom .18s;
   border:2px solid #4be49a;border-radius:8px;box-shadow:0 0 0 800px rgba(0,0,0,.26);}
+#ps-guide.wide {left:11%;right:11%;top:28%;bottom:28%;}
 #ps-guide span {position:absolute;top:-1.35em;left:0;color:#5bf9ac;font-size:11px;
   font-weight:700;letter-spacing:.06em;text-shadow:0 1px 2px #000;}
 #ps-camera-message {position:absolute;left:10%;right:10%;top:40%;
@@ -302,6 +314,7 @@ CAMERA_CSS = """
 .ps-controls {display:flex;align-items:center;gap:10px;padding-top:7px;}
 .ps-controls button {border:0;border-radius:7px;background:#ee5959;color:white;
   padding:7px 13px;font-size:13px;font-weight:600;min-height:35px;cursor:pointer;}
+#ps-guide-size {background:#25262b; border:1px solid #454650; color:#e6e6e6; white-space:nowrap;}
 .ps-controls button[hidden] {display:none;}
 #ps-camera-status {font-size:12px;color:#999;}
 """
@@ -315,6 +328,7 @@ export default function (component) {
   const stopBtn = root.querySelector('#ps-stop');
   const status = root.querySelector('#ps-camera-status');
   const guide = root.querySelector('#ps-guide');
+  const guideBtn = root.querySelector('#ps-guide-size');
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', {willReadFrequently:false});
   let stream = null;
@@ -354,12 +368,12 @@ export default function (component) {
     const sh = Math.max(1, Math.min(vh - sy, gh));
     // Kırmızı/tırtıklı farklı fontlarda rakam çizgileri korunabilsin.
     // Smaller JPEG: faster phone->server upload and faster CPU recognition.
-    const factor = Math.min(1, 880 / sw);
+    const factor = Math.min(1, 760 / sw);
     canvas.width = Math.max(1, Math.floor(sw * factor));
     canvas.height = Math.max(1, Math.floor(sh * factor));
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
     const jpeg = canvas.toDataURL('image/jpeg', 0.80);
-    component.setTriggerValue('frame', jpeg.split(',')[1]);
+    component.setTriggerValue('frame', {image:jpeg.split(',')[1], guide:guide.classList.contains('wide') ? 'wide' : 'tight'});
     status.textContent = 'Tarama açık';
   }
 
@@ -380,8 +394,8 @@ export default function (component) {
       startBtn.hidden = true;
       stopBtn.hidden = false;
       status.textContent = 'Canlı kamera açık';
-      timer = setInterval(capture, 1000);
-      setTimeout(capture, 250);
+      timer = setInterval(capture, 850);
+      setTimeout(capture, 120);
     } catch(err) {
       status.textContent = 'Kamera açılamadı: ' + (err?.name || 'izin veya tarayıcı');
       msg.textContent = 'Safari kamera iznini kontrol et. Gerekirse Fotoğraf çek modunu kullan.';
@@ -389,6 +403,12 @@ export default function (component) {
   }
   startBtn.addEventListener('click', startCamera);
   stopBtn.addEventListener('click', stopCamera);
+  guideBtn.addEventListener('click', () => {
+    guide.classList.toggle('wide');
+    guideBtn.textContent = guide.classList.contains('wide') ? '↙ Alanı daralt' : '↔ Alanı genişlet';
+    status.textContent = guide.classList.contains('wide') ? 'Geniş alan · birden fazla fiyatı ayıklar' : 'Dar alan · tek fiyat';
+    if (stream) capture();
+  });
   return () => {disposed = true;stopCamera();};
 }
 """
@@ -399,40 +419,54 @@ if mode == "Canlı kamera":
     start_worker(state, reader)
 
     def on_browser_frame():
-        payload = st.session_state.get("ps_browser_cam_v9")
+        payload = st.session_state.get("ps_browser_cam_v10")
         # Components v2 değerleri Streamlit sürümüne göre dict veya
         # attribute erişimli sonuç nesnesi olabiliyor.
         if isinstance(payload, dict):
-            raw_b64 = payload.get("frame")
+            frame_value = payload.get("frame")
         else:
-            raw_b64 = getattr(payload, "frame", None) if payload is not None else None
-        if not isinstance(raw_b64, str) or len(raw_b64) > 3_000_000:
+            frame_value = getattr(payload, "frame", None) if payload is not None else None
+        if not isinstance(frame_value, dict):
+            return
+        raw_b64 = frame_value.get("image")
+        guide_mode = frame_value.get("guide")
+        if guide_mode not in ("tight", "wide") or not isinstance(raw_b64, str) or len(raw_b64) > 3_000_000:
             return
         try:
             decoded = base64.b64decode(raw_b64, validate=True)
             arr = cv2.imdecode(np.frombuffer(decoded, dtype=np.uint8), cv2.IMREAD_COLOR)
             if arr is not None:
                 with state.lock:
+                    if state.guide_mode != guide_mode:
+                        state.guide_mode = guide_mode
+                        state.view_version += 1
+                        state.proposed = None
+                        state.proposed_hits = 0
+                        state.price = None
+                        state.raw = ""
+                        state.scan_attempt = 0
+                        state.status = "Yeni tarama alanı seçildi; fiyatı hizala"
                     selected_currency = state.currency
-                with state.lock:
+                    version = state.view_version
                     state.frames_received += 1
                     state.last_frame_received = time.monotonic()
-                enqueue_fresh(state, (arr, selected_currency))
+                enqueue_fresh(state, (arr, selected_currency, guide_mode, version))
         except (ValueError, TypeError):
             pass
 
     local_camera = st.components.v2.component(
-        "price_scanner_browser_camera_v9",
+        "price_scanner_browser_camera_v10",
         html=CAMERA_HTML, css=CAMERA_CSS, js=CAMERA_JS,
     )
     local_camera(
-        key="ps_browser_cam_v9",
+        key="ps_browser_cam_v10",
         on_frame_change=on_browser_frame,
         height=282,
     )
     st.markdown(
-        '<div class="ps-tip">Telefon ekranında canlı önizleme · fiyatı yeşil çerçeveye getir. '
-        'Yalnızca rakamlar ve ayraçlar (.,) hesaplanır. Diğer semboller fiyat değildir. Birden fazla rakamda merkezdeki belirgin fiyat aranır.</div>',
+        '<div class="ps-tip">Fiyatı tek başına <strong>dar yeşil kutunun</strong> ortasına getir. '
+        'İndirim oranını, eski fiyatı ve yorumları kutunun dışında bırak. '
+        'Uzun bir tutar sığmazsa ↔ Alanı genişlet seçeneğini kullan.</div>',
         unsafe_allow_html=True,
     )
 else:
@@ -444,8 +478,6 @@ else:
         cropped = img[y1:y2, x1:x2]
         # Fotoğraf modunda görüntü sabittir; şüpheli OCR çapraz kontrol edilir.
         reading = scan_crop(cropped, currency, load_reader())
-        if reading.amount is None:
-            reading = scan_crop(img, currency, load_reader())
         if reading.amount is not None:
             with state.lock:
                 state.price, state.raw = reading.amount, reading.raw
@@ -467,6 +499,7 @@ def show_results():
     with state.lock:
         scanned, raw, status = state.price, state.raw, state.status
         received, last_seen = state.frames_received, state.last_frame_received
+        guide_mode = state.guide_mode
         last_ocr = state.last_ocr_at
         ocr_ms = state.ocr_elapsed_ms
         proposed, proposed_hits = state.proposed, state.proposed_hits
