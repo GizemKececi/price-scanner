@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 import cv2
@@ -18,6 +18,11 @@ ZERO_DECIMAL = {"KRW", "JPY"}
 NUMBER_GROUP = re.compile(
     r"(?<![0-9])(?:[0-9]{1,3}(?:[,. \u00a0'’][0-9]{3})+(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)(?![0-9])"
 )
+# KRW/JPY have no minor unit: a valid amount is plain digits or properly
+# grouped thousands (3 digits per group). "72,4" / "9,95" are TRUNCATED reads,
+# not decimals; ".00" is harmless. Gluing their digits (72,4 -> 724) turned
+# partial OCR output into a plausible but wrong price.
+ZERO_DECIMAL_FORMAT = re.compile(r"(\d{1,3}(?:[,. \u00a0'’]\d{3})+|\d+)(?:[.,]0{1,2})?")
 CURRENCY_CONTEXT = re.compile(r"[₩￦원¥￥円$€£₺₹฿₫]", re.I)
 PERCENT_SUFFIX = re.compile(r"^\s*(?:[%％]|퍼센트|percent\b|pct\b|\bOFF\b)", re.I)
 REVIEW_COUNT_SUFFIX = re.compile(r"^\s*\+|^\s*\)\s*\+?|^\s*명\b", re.I)
@@ -40,6 +45,9 @@ class Reading:
     confidence: float = 0.0
     note: str = ""
     alternatives: tuple[Decimal, ...] = ()
+    # Diagnostics for the app's debug panel (what the OCR actually saw).
+    # Not part of equality and never used for calculations.
+    debug: dict | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -60,11 +68,17 @@ def parse_amount(raw: str, currency: str) -> Decimal | None:
     s = unicodedata.normalize("NFKC", raw).strip().replace("\u00a0", " ")
     if not NUMBER_GROUP.fullmatch(s):
         return None
+    if currency in ZERO_DECIMAL:
+        m = ZERO_DECIMAL_FORMAT.fullmatch(s)
+        if not m:
+            return None
+        digits = re.sub(r"[^0-9]", "", m.group(1))
+        if not digits or len(digits) > 10:
+            return None
+        return Decimal(digits)
     digits = re.sub(r"[^0-9]", "", s)
     if not digits or len(digits) > 10:
         return None
-    if currency in ZERO_DECIMAL:
-        return Decimal(digits)
     clean = s.replace(" ", "").replace("'", "").replace("’", "")
     last_sep = max(clean.rfind("."), clean.rfind(","))
     places = len(clean) - last_sep - 1 if last_sep >= 0 else 0

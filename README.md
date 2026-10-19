@@ -1,6 +1,32 @@
-# Price Scanner v11 — Tam fiyat satırı
+# Price Scanner v12 — Tam fiyat satırı
 
 Bu sürüm, **72.000 yerine 4.000** gibi yalnızca fiyatın son hanelerini algılama sorununu azaltmayı hedefler. v10'daki tanıma yöntemi yeşil bant içindeki uzun ve çoğu boşluk olan görüntüyü tek satır olarak küçültüp OCR'ye veriyordu. Yeni sürüm görüntünün içindeki asıl yazı satırını hızlı görüntü işleme ile bulup dikey olarak yakınlaştırır; yatay olarak **hiçbir rakamı kırpmaz**.
+
+## Kurulum ve çalıştırma
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+İlk çalıştırmada EasyOCR kendi OCR modelini indirir (internet gerekir, bir kez).
+
+## v12 — "72,400 yerine 4900 okuyor" hatası
+
+**Sebep (kodda ve görüntüde doğrulandı):** `price_tight.py` içindeki `_focus_price_line`, yüksekliği kadrajın %72'sinden büyük her rakamı "gürültü" sayıp atıyordu. Fiyat yeşil bandı doldurunca (arayüzün istediği de bu) bütün rakamlar atılıyor, geriye virgül ve küçük parçalar kalıyor ve kod **rakamların yalnızca alt ~%30'unu** OCR'a gönderiyordu. Sonuç: 72,400 → "4,900" gibi anlamsız okumalar. Koyu zeminde açık yazı (beyaz rakam, kırmızı etiket) ise maske yüzünden daha da kötüydü.
+
+**Değişiklikler**
+
+- `price_tight.py`: satır bulma baştan yazıldı. Uzun rakamlar atılmaz; her glyph tam dahil edilir; açık/koyu yazı ve renkli zemin desteklenir; güvenilmezse bütün kırpım kullanılır; rakamlar görüntü kenarına değiyorsa OCR'a boşluk payı eklenir.
+- `price_tight.py`: fiyatın başı/sonu yeşil çerçeveden taşıyorsa (kesik fiyat) okuma **yayımlanmaz**, kullanıcıya "çerçevenin dışında kalıyor" denir. Tam iki rakamın arasından kesilen fiyat bu yöntemle fark edilemez.
+- `price_ocr.py`: KRW/JPY için `72,4` → 724, `72,40` → 7240, `9,950.00` → 995000 gibi bozuk gruplamalar artık reddedilir (`.00` güvenle atılır). Diğer para birimleri değişmedi.
+- `app.py`: ⚙️ bölümüne **"🔍 OCR'nin gördüğü görüntüyü göster (teşhis)"** eklendi. Yeşil kutunun içini, OCR'a giden görüntüyü ve ham OCR çıktısını canlı gösterir. Yanlış okuma sürerse nedeni bu üç satırdan anlarsın.
+
+## Test
+
+`python -m unittest discover -p 'test_*.py'`
+
+62 test geçer (43 eski + 15 `test_focus_v12.py` + 4 `test_parse_zero_decimal.py`). Yeni testler eski kodda başarısız olacak şekilde yazıldı. Bunlar gerçek EasyOCR modeli kullanmaz; OCR'ın **aldığı görüntünün** tam olduğunu doğrular. Gerçek iPhone/EasyOCR doğruluğunu kanıtlamaz.
 
 ## Nasıl kullanılır?
 
@@ -24,4 +50,4 @@ Bu sürüm, **72.000 yerine 4.000** gibi yalnızca fiyatın son hanelerini algı
 
 `python -m unittest discover -p 'test_*.py'`
 
-43 sentetik/metin tabanlı test geçmiştir. Testler gerçek iPhone OCR doğruluğunu veya kesin bir 5 saniye süresini kanıtlamaz; gerçek kamera ve Streamlit CPU performansına bağlıdır.
+Testler gerçek iPhone OCR doğruluğunu veya kesin bir 5 saniye süresini kanıtlamaz; gerçek kamera ve Streamlit CPU performansına bağlıdır.

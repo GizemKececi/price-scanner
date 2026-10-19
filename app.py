@@ -134,6 +134,10 @@ class ScanState:
         self.last_attempted_price: Decimal | None = None
         self.frames_received = 0
         self.confirmed_at = 0.0
+        # Teşhis: OCR'ın gerçekten gördüğü görüntüler (yalnızca gösterim için).
+        self.debug_crop = None
+        self.debug_input = None
+        self.debug_tokens: list = []
         self.status = "Kamerayı başlatıp fiyatı yeşil çerçevenin içine getir."
 
 
@@ -181,6 +185,10 @@ def start_worker(state: ScanState, reader):
                     state.ocr_elapsed_ms = int((now - begun)*1000)
                     number, raw = reading.amount, reading.raw
                     state.last_ocr_raw = raw or (str(reading.alternatives) if reading.alternatives else "")
+                    dbg = reading.debug or {}
+                    state.debug_crop = dbg.get("crop")
+                    state.debug_input = dbg.get("ocr_input")
+                    state.debug_tokens = dbg.get("tokens", [])
                     state.scan_attempt = ((1 if attempt == 0 else 0) if number is not None
                                           else (attempt + 1) % 3)
                     if number is None:
@@ -258,9 +266,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "scanner_state_v11" not in st.session_state:
-    st.session_state.scanner_state_v11 = ScanState()
-state: ScanState = st.session_state.scanner_state_v11
+if "scanner_state_v12" not in st.session_state:
+    st.session_state.scanner_state_v12 = ScanState()
+state: ScanState = st.session_state.scanner_state_v12
 
 with state.lock:
     if state.country != country or state.currency != currency:
@@ -565,6 +573,19 @@ def show_results():
 
 show_results()
 
+
+@st.fragment(run_every="1.5s")
+def show_debug():
+    with state.lock:
+        crop, seen, tokens = state.debug_crop, state.debug_input, list(state.debug_tokens)
+    if crop is None or seen is None:
+        st.caption("Henüz görüntü yok (canlı kamerada dar alan modu açıkken görünür).")
+        return
+    st.image(crop, caption="1) Kameradan gelen yeşil kutunun içi", channels="RGB")
+    st.image(seen, caption="2) OCR'ın GERÇEKTE gördüğü görüntü (rakamların tamamı görünmeli)", channels="RGB")
+    st.text("OCR ham çıktısı: " + (" | ".join(f"{t} ({c:.2f})" for t, c in tokens) or "—"))
+
+
 with st.expander("⚙️ Fiyat düzeltme, kur yenileme ve tax free ayrıntıları"):
     typed = st.number_input(
         f"Fiyatı elle gir ({currency}) — 0 = kamerayı kullan",
@@ -576,6 +597,8 @@ with st.expander("⚙️ Fiyat düzeltme, kur yenileme ve tax free ayrıntılar�
         debug_raw = state.last_ocr_raw
         debug_ms = state.ocr_elapsed_ms
     st.caption(f"OCR'nin son seçtiği rakam: {debug_raw or 'Henüz yok'} · İşleme süresi: {debug_ms/1000:.1f} sn")
+    if st.checkbox("🔍 OCR'nin gördüğü görüntüyü göster (teşhis)", key="ps_debug_view"):
+        show_debug()
     if st.button("🔄 Kuru güncelle", use_container_width=True):
         fetch_fx.clear()
         st.rerun()
